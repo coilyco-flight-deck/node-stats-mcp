@@ -1,0 +1,40 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.10
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.20.0
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - psutil>=6.0.0
+          - mcp>=1.14.0
+
+  - repo: local
+    hooks:
+      - id: trufflehog
+        name: trufflehog (secret scan, offline)
+        description: Detect secrets in staged changes via local trufflehog binary (no API verification).
+        entry: trufflehog git file://. --since-commit HEAD --no-verification --no-update --fail
+        language: system
+        pass_filenames: false
+        stages: [pre-commit, pre-push]
+
+  # BEGIN managed by agentic-os/scripts/apply-agentic-os-hooks.py
+  - repo: https://github.com/coilyco-flight-deck/agentic-os
+    rev: v0.18.0
+    hooks:
+      - id: catalog-doc-size
+      - id: catalog-trifecta
+      - id: documentation-layout
+      - id: context-load-points
+      - id: catalog-block-present
+      - id: validate-skills
+      - id: dead-cross-links
+      - id: repo-pointer-skills
+      - id: trufflehog
+  # END managed by agentic-os/scripts/apply-agentic-os-hooks.py
