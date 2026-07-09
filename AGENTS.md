@@ -46,4 +46,4 @@ Name the actor in action sentences.
 - [docs/FEATURES.md](docs/FEATURES.md) - inventory of what ships today.
 - [.ward/ward.yaml](.ward/ward.yaml) - allowlisted commands + catalog block.
 
-Cross-reference convention from [coilysiren/agentic-os#59](https://github.com/coilyco-flight-deck/agentic-os/issues/59).
+Cross-reference convention from [features-release-tooling.md](docs/features-release-tooling.md).
