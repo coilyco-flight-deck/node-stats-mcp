@@ -10,8 +10,8 @@ pod). See the deploy bundle in coilyco-bridge/deploy/services/node-stats-mcp.
 File introspection is prefix-allowlisted, never arbitrary: stat_path and
 read_text_head resolve the real path and refuse anything outside
 NODE_STATS_READABLE_ROOTS (empty by default = file reads denied). This is the
-enum-not-path discipline from eco-app#42 generalized to a root allowlist, so the
-tool cannot be walked into /host/root/.ssh.
+enum-not-path discipline from the upstream node-introspection example,
+generalized to a root allowlist, so the tool cannot be walked into /host/root/.ssh.
 """
 
 from __future__ import annotations

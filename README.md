@@ -2,7 +2,7 @@
 
 A node-local MCP battery. It reads the node it runs on - CPU, memory, disk, load, network, top processes, and bounded file metadata - and serves that over MCP (streamable-HTTP), so an agent can inspect a node without a host bind mount.
 
-This is the generic node-introspection spine, instance #1 of the pattern discussed in [coilyco-gaming/eco-app#42](https://forgejo.coilysiren.me/coilyco-gaming/eco-app/issues/42): a per-node MCP agent, the same shape as node-exporter (DaemonSet-or-node-pinned + hostPath + host namespaces), but exposing a tool surface instead of Prometheus metrics.
+This is the generic node-introspection spine, first instance of the upstream pattern: a per-node MCP agent, the same shape as node-exporter (DaemonSet-or-node-pinned + hostPath + host namespaces), but exposing a tool surface instead of Prometheus metrics.
 
 ## Node view, not pod view
 
