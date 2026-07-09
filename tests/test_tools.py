@@ -66,3 +66,163 @@ def test_top_processes_validates_sort(monkeypatch: pytest.MonkeyPatch) -> None:
     server = _load(monkeypatch, "/", "")
     with pytest.raises(ValueError, match="sort_by"):
         server.get_top_processes(sort_by="bogus")
+
+
+def test_k3s_pods_normalize_api_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = _load(monkeypatch, "/", "")
+    monkeypatch.setattr(
+        server,
+        "_k8s_list",
+        lambda path: (
+            [
+                {
+                    "metadata": {
+                        "name": "open-webui-123",
+                        "namespace": "ai",
+                        "uid": "11111111-1111-1111-1111-111111111111",
+                        "creationTimestamp": "2026-07-09T20:00:00Z",
+                    },
+                    "spec": {
+                        "nodeName": "kai-server",
+                        "containers": [
+                            {"name": "web", "image": "ghcr.io/open-webui/open-webui:latest"}
+                        ],
+                    },
+                    "status": {
+                        "phase": "Running",
+                        "podIP": "10.0.0.10",
+                        "containerStatuses": [
+                            {
+                                "name": "web",
+                                "restartCount": 2,
+                                "ready": True,
+                                "containerID": "containerd://a1b2c3d4e5f6",
+                                "state": {"running": {}},
+                            }
+                        ],
+                    },
+                }
+            ],
+            [],
+        ),
+    )
+
+    got = server.get_k3s_pods()
+    assert got["errors"] == []
+    assert got["pods"][0]["namespace"] == "ai"
+    assert got["pods"][0]["restart_count"] == 2
+    assert got["pods"][0]["age_seconds"] is not None
+    assert got["pods"][0]["containers"][0]["container_id"] == "a1b2c3d4e5f6"
+
+
+def test_k3s_process_attribution_uses_cgroup_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = _load(monkeypatch, "/", "")
+    pod = {
+        "namespace": "ai",
+        "pod": "open-webui-123",
+        "uid": "11111111-1111-1111-1111-111111111111",
+        "containers": [
+            {
+                "name": "web",
+                "image": "ghcr.io/open-webui/open-webui:latest",
+                "container_id": "a1b2c3d4e5f6",
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        server,
+        "_k8s_pod_inventory",
+        lambda: (
+            [pod],
+            {"a1b2c3d4e5f6": (pod, pod["containers"][0])},
+            {pod["uid"]: pod},
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_iter_host_processes",
+        lambda: [
+            {
+                "pid": 42,
+                "name": "python",
+                "username": "root",
+                "cpu_percent": 0.0,
+                "memory_percent": 1.5,
+                "rss_bytes": 123456,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        server,
+        "_read_host_text",
+        lambda path: (
+            "0::/kubepods.slice/kubepods-besteffort.slice/"
+            "kubepods-besteffort-pod11111111-1111-1111-1111-111111111111.slice/"
+            "cri-containerd-a1b2c3d4e5f6.scope"
+            if path == "/proc/42/cgroup"
+            else None
+        ),
+    )
+
+    got = server.get_k3s_process_attribution(limit=1)
+    proc = got["processes"][0]
+    assert proc["name"] == "python"
+    assert proc["kubernetes"] == {
+        "namespace": "ai",
+        "pod": "open-webui-123",
+        "container": "web",
+        "pod_uid": "11111111-1111-1111-1111-111111111111",
+        "container_id": "a1b2c3d4e5f6",
+        "matched_by": "container_id",
+    }
+
+
+def test_k3s_container_memory_falls_back_to_cgroup_rss(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = _load(monkeypatch, "/", "")
+    pod = {
+        "namespace": "ai",
+        "pod": "reddit-mcp",
+        "uid": "22222222-2222-2222-2222-222222222222",
+        "containers": [
+            {
+                "name": "app",
+                "image": "ghcr.io/example/reddit-mcp:latest",
+                "container_id": "f1e2d3c4b5a6",
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        server,
+        "_k8s_pod_inventory",
+        lambda: (
+            [pod],
+            {"f1e2d3c4b5a6": (pod, pod["containers"][0])},
+            {pod["uid"]: pod},
+            [],
+        ),
+    )
+    monkeypatch.setattr(server, "_k8s_pod_metrics", lambda: ([], ["metrics unavailable"]))
+    monkeypatch.setattr(
+        server,
+        "_iter_host_processes",
+        lambda: [
+            {"pid": 7, "rss_bytes": 2048, "name": "python", "cpu_percent": 0.0},
+            {"pid": 8, "rss_bytes": 1024, "name": "uvicorn", "cpu_percent": 0.0},
+        ],
+    )
+    monkeypatch.setattr(
+        server,
+        "_read_host_text",
+        lambda path: (
+            "0::/kubepods.slice/kubepods-besteffort.slice/"
+            "kubepods-besteffort-pod22222222-2222-2222-2222-222222222222.slice/"
+            "cri-containerd-f1e2d3c4b5a6.scope"
+            if path in {"/proc/7/cgroup", "/proc/8/cgroup"}
+            else None
+        ),
+    )
+
+    got = server.get_k3s_container_memory()
+    assert got["source"] == "cgroup-rss"
+    assert got["containers"][0]["memory_bytes"] == 3072

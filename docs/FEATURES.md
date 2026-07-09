@@ -9,6 +9,9 @@ Living inventory of what ships from this repo. One image, one process: a FastMCP
 - **get_disk_info** - per-partition usage and mount info, resolved under `ROOTFS`.
 - **get_network_info** - aggregate and per-interface I/O counters (node-wide under hostNetwork).
 - **get_top_processes** - top N by cpu or memory (node-wide under hostPID).
+- **get_k3s_pods** - read-only namespace/pod/container inventory from the k3s API.
+- **get_k3s_container_memory** - approximate per-container memory from metrics-server or host cgroups.
+- **get_k3s_process_attribution** - top host processes annotated with namespace/pod/container when cgroup metadata resolves.
 - **get_system_snapshot** - one-shot overview: cpu, memory, load, boot time, uptime, logged-in users.
 - **stat_path** - size/mode/mtime/type for a path under the readable-root allowlist.
 - **read_text_head** - up to `max_bytes` (capped) of a text file under the allowlist.
@@ -25,6 +28,8 @@ Living inventory of what ships from this repo. One image, one process: a FastMCP
 - `ROOTFS` (default `/`) - where the host root is mounted in the pod (`/host` in the deploy).
 - `NODE_STATS_READABLE_ROOTS` - colon-separated read allowlist, interpreted inside `ROOTFS`.
 - `NODE_STATS_MAX_READ_BYTES` (default 65536).
+- `NODE_STATS_KUBECONFIG` (default `/etc/rancher/k3s/k3s.yaml`, interpreted inside `ROOTFS`) - host kubeconfig used for the k3s inventory when present.
+- `NODE_STATS_K8S_TIMEOUT_SECONDS` (default 3) - timeout for Kubernetes API reads.
 
 ## Deploy
 
@@ -34,6 +39,7 @@ Node-pinned hostPID + hostNetwork pod, image published to the in-cluster registr
 
 - [../README.md](../README.md) - human-facing intro.
 - [../AGENTS.md](../AGENTS.md) - agent operating context.
+- [k3s-inventory.md](k3s-inventory.md) - k3s pod, container, and attribution walkthrough.
 - [../.ward/ward.yaml](../.ward/ward.yaml) - allowlisted commands + catalog block.
 
 Cross-reference convention from [features-release-tooling.md](features-release-tooling.md).

@@ -8,6 +8,16 @@ This is the generic node-introspection spine, first instance of the upstream pat
 
 True node stats need the pod to borrow the host's namespaces: **hostPID** so process listings see the node, **hostNetwork** so net counters are the node's, and a read-only **hostPath** of `/` at `/host` (with `ROOTFS=/host`) for disk. CPU and memory come from the non-namespaced `/proc/{stat,meminfo}` regardless. The deploy bundle wires all of this - see below.
 
+## k3s view
+
+The server also exposes a read-only k3s inventory surface for host-to-pod attribution:
+
+- `get_k3s_pods` - namespace, pod, phase, node, restart count, container names/images, pod IP, age.
+- `get_k3s_container_memory` - per-container memory from metrics-server when available, else approximate RSS summed from host cgroups.
+- `get_k3s_process_attribution` - top host processes annotated with the owning pod/container when cgroup data and pod metadata line up.
+
+The API read path prefers the host-mounted k3s admin kubeconfig at `/host/etc/rancher/k3s/k3s.yaml` and falls back to the pod's service account when needed. All three tools stay read-only.
+
 ## Safety
 
 Read-only by construction: every tool is a read, none mutate the host. File introspection (`stat_path`, `read_text_head`) is **prefix-allowlisted** via `NODE_STATS_READABLE_ROOTS` (empty by default = file reads denied) and size-capped, so a tool can never be walked into `/host/root/.ssh`. Reach is gated at the network layer (the tailnet / node), not by the tool.
