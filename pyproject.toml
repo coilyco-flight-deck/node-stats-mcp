@@ -60,9 +60,3 @@ org = "coilyco-flight-deck"
 
 [tool.agentic-os.issue-reference-guard]
 enabled = true
-# Keep the catalog-trifecta convention footer in the three top-level entrypoints.
-allow_globs = [
-  "README.md",
-  "AGENTS.md",
-  "docs/FEATURES.md",
-]
