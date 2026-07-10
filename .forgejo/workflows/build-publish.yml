@@ -22,6 +22,12 @@ jobs:
       - run: uv run ruff format --check src tests
       - run: uv run mypy src tests
 
+      - name: Alert Telegram on main failure
+        if: ${{ failure() && github.ref == 'refs/heads/main' }}
+        uses: coilyco-flight-deck/agentic-os/actions/telegram-alert@main
+        with:
+          bot-token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat-id: ${{ secrets.TELEGRAM_RED_CHAT_ID }}
   publish:
     runs-on: docker
     container: forgejo.coilysiren.me/coilyco-flight-deck/agentic-os:v0.195.0
@@ -56,3 +62,9 @@ jobs:
           IMAGE=192.168.0.194:30500/node-stats-mcp:${{ github.sha }}
           docker build -t "$IMAGE" .
           docker push "$IMAGE"
+      - name: Alert Telegram on main failure
+        if: ${{ failure() && github.ref == 'refs/heads/main' }}
+        uses: coilyco-flight-deck/agentic-os/actions/telegram-alert@main
+        with:
+          bot-token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat-id: ${{ secrets.TELEGRAM_RED_CHAT_ID }}
