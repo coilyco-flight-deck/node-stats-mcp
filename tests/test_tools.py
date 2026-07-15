@@ -9,15 +9,32 @@ cannot be escaped.
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 from types import ModuleType
 
 import pytest
 
 
-def _load(monkeypatch: pytest.MonkeyPatch, tmp_root: str, roots: str) -> ModuleType:
+def _load(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_root: str,
+    roots: str,
+    pressure_paths: str | None = None,
+    max_du_entries: str | None = None,
+) -> ModuleType:
     """Reimport the server module with ROOTFS + allowlist env applied at import time."""
     monkeypatch.setenv("ROOTFS", tmp_root)
     monkeypatch.setenv("NODE_STATS_READABLE_ROOTS", roots)
+    monkeypatch.setenv("NODE_STATS_DISK_WARN_PERCENT", "80")
+    monkeypatch.setenv("NODE_STATS_DISK_CRITICAL_PERCENT", "85")
+    if pressure_paths is None:
+        monkeypatch.delenv("NODE_STATS_PRESSURE_PATHS", raising=False)
+    else:
+        monkeypatch.setenv("NODE_STATS_PRESSURE_PATHS", pressure_paths)
+    if max_du_entries is None:
+        monkeypatch.delenv("NODE_STATS_MAX_DU_ENTRIES", raising=False)
+    else:
+        monkeypatch.setenv("NODE_STATS_MAX_DU_ENTRIES", max_du_entries)
     import node_stats_mcp.server as server
 
     return importlib.reload(server)
@@ -60,6 +77,69 @@ def test_read_is_capped(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     got = server.read_text_head("big.txt", max_bytes=100)
     assert got["bytes_returned"] == 100
     assert got["truncated"] is True
+
+
+def test_filesystem_pressure_shape(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    server = _load(monkeypatch, str(tmp_path), "")
+    got = server.get_filesystem_pressure()["root"]
+
+    assert got["path"] == "/"
+    assert got["total_bytes"] > 0
+    assert got["available_bytes"] >= 0
+    assert got["reserved_bytes"] >= 0
+    assert got["pressure_used_bytes"] >= 0
+    assert (
+        got["bytes_until_critical"] == int(got["total_bytes"] * 0.85) - got["pressure_used_bytes"]
+    )
+    assert got["bytes_over_critical"] >= 0
+    assert got["status"] in {"ok", "warning", "critical"}
+    assert got["warn_percent"] == 80.0
+    assert got["critical_percent"] == 85.0
+    assert got["inodes_total"] >= 0
+    assert got["inodes_used_percent"] >= 0.0
+
+
+def test_pressure_path_usage_uses_fixed_env_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "hot").mkdir()
+    (tmp_path / "cold").mkdir()
+    (tmp_path / "hot" / "blob.bin").write_bytes(b"x" * 1024 * 1024)
+    (tmp_path / "cold" / "tiny.txt").write_text("x")
+    server = _load(monkeypatch, str(tmp_path), "", pressure_paths="/hot:/cold:/missing")
+
+    got = server.get_pressure_path_usage(limit=10, max_entries_per_path=1000)
+    by_path = {entry["path"]: entry for entry in got["paths"]}
+
+    assert got["configured_paths"] == ["/hot", "/cold", "/missing"]
+    assert got["same_filesystem_only"] is True
+    assert by_path["/missing"]["exists"] is False
+    assert by_path["/hot"]["exists"] is True
+    assert by_path["/hot"]["size_bytes"] > by_path["/cold"]["size_bytes"]
+    assert by_path["/hot"]["permission_errors"] == 0
+    assert by_path["/hot"]["scan_errors"] == 0
+    assert by_path["/hot"]["skipped_different_filesystem"] == 0
+
+
+def test_pressure_path_usage_caps_entries(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / "hot").mkdir()
+    for idx in range(10):
+        (tmp_path / "hot" / f"{idx}.txt").write_text("x")
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        pressure_paths="/hot",
+        max_du_entries="3",
+    )
+
+    got = server.get_pressure_path_usage(limit=1, max_entries_per_path=1000)
+    path = got["paths"][0]
+
+    assert got["max_entries_per_path"] == 3
+    assert path["path"] == "/hot"
+    assert path["entries_scanned"] == 3
+    assert path["truncated"] is True
 
 
 def test_top_processes_validates_sort(monkeypatch: pytest.MonkeyPatch) -> None:

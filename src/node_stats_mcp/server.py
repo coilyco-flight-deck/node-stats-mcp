@@ -1,7 +1,7 @@
 """FastMCP server exposing node-local host introspection over streamable-HTTP.
 
 Read-only by construction: every tool is a read, no tool mutates the host. True
-*node* stats (not the pod's cgroup view) rely on the deployment giving the pod
+node stats (not the pod's cgroup view) rely on the deployment giving the pod
 the host's namespaces - hostPID for processes, hostNetwork for net counters -
 and CPU/memory come from the non-namespaced /proc/{stat,meminfo} directly. Disk
 reads resolve under ROOTFS (the host root, mounted read-only at /host in the
@@ -24,6 +24,7 @@ import json
 import os
 import re
 import ssl
+import stat
 import tempfile
 import time
 from collections import defaultdict
@@ -39,7 +40,7 @@ import psutil
 from mcp.server.fastmcp import FastMCP
 
 # Host root inside the pod. The deployment mounts the node's / read-only at
-# /host and sets ROOTFS=/host; bare local runs leave it at / (the real root).
+# /host and sets ROOTFS=/host. Bare local runs leave it at / (the real root).
 ROOTFS = os.environ.get("ROOTFS", "/")
 
 # Colon-separated prefixes the file tools may read under, resolved against the
@@ -52,6 +53,31 @@ _READABLE_ROOTS = [r for r in os.environ.get("NODE_STATS_READABLE_ROOTS", "").sp
 _MAX_READ_BYTES = int(os.environ.get("NODE_STATS_MAX_READ_BYTES", "65536"))
 _K8S_TIMEOUT_SECONDS = float(os.environ.get("NODE_STATS_K8S_TIMEOUT_SECONDS", "3"))
 _KUBECONFIG_PATH = os.environ.get("NODE_STATS_KUBECONFIG", "/etc/rancher/k3s/k3s.yaml")
+
+_DISK_WARN_PERCENT = float(os.environ.get("NODE_STATS_DISK_WARN_PERCENT", "80"))
+_DISK_CRITICAL_PERCENT = float(os.environ.get("NODE_STATS_DISK_CRITICAL_PERCENT", "85"))
+
+_DEFAULT_PRESSURE_PATHS = (
+    "/home",
+    "/srv",
+    "/tmp",
+    "/var/tmp",
+    "/var/log",
+    "/var/log/journal",
+    "/var/lib/rancher/k3s",
+    "/var/lib/rancher/k3s/agent/containerd",
+    "/var/lib/kubelet",
+    "/var/lib/containerd",
+    "/var/lib/snapd",
+)
+_PRESSURE_PATHS = tuple(
+    p
+    for p in os.environ.get("NODE_STATS_PRESSURE_PATHS", ":".join(_DEFAULT_PRESSURE_PATHS)).split(
+        ":"
+    )
+    if p
+)
+_MAX_DU_ENTRIES = int(os.environ.get("NODE_STATS_MAX_DU_ENTRIES", "200000"))
 
 mcp = FastMCP(
     "node-stats",
@@ -610,6 +636,129 @@ def _resolve_readable(path: str) -> Path:
     return target
 
 
+def _allocated_bytes(path_stat: os.stat_result) -> int:
+    blocks = getattr(path_stat, "st_blocks", 0)
+    if blocks:
+        return int(blocks) * 512
+    return int(path_stat.st_size)
+
+
+def _public_host_path(path: Path) -> str:
+    try:
+        relative = path.relative_to(Path(ROOTFS))
+    except ValueError:
+        return str(path)
+    return "/" + str(relative)
+
+
+def _filesystem_pressure(path: str) -> dict[str, Any]:
+    target = _host_path(path)
+    fs = os.statvfs(target)
+    total = fs.f_frsize * fs.f_blocks
+    free = fs.f_frsize * fs.f_bfree
+    available = fs.f_frsize * fs.f_bavail
+    reserved = free - available
+    pressure_used = total - available
+    used_percent = (pressure_used / total * 100.0) if total else 0.0
+    warn_used = int(total * (_DISK_WARN_PERCENT / 100.0))
+    critical_used = int(total * (_DISK_CRITICAL_PERCENT / 100.0))
+    inode_percent = ((fs.f_files - fs.f_favail) / fs.f_files) * 100.0 if fs.f_files else 0.0
+    if used_percent >= _DISK_CRITICAL_PERCENT:
+        status = "critical"
+    elif used_percent >= _DISK_WARN_PERCENT:
+        status = "warning"
+    else:
+        status = "ok"
+    return {
+        "path": path,
+        "total_bytes": total,
+        "free_bytes": free,
+        "available_bytes": available,
+        "reserved_bytes": reserved,
+        "pressure_used_bytes": pressure_used,
+        "used_percent": used_percent,
+        "status": status,
+        "warn_percent": _DISK_WARN_PERCENT,
+        "critical_percent": _DISK_CRITICAL_PERCENT,
+        "bytes_until_warn": warn_used - pressure_used,
+        "bytes_until_critical": critical_used - pressure_used,
+        "bytes_over_warn": max(0, pressure_used - warn_used),
+        "bytes_over_critical": max(0, pressure_used - critical_used),
+        "inodes_total": fs.f_files,
+        "inodes_free": fs.f_ffree,
+        "inodes_available": fs.f_favail,
+        "inodes_used_percent": inode_percent,
+    }
+
+
+def _du_path(path: Path, max_entries: int, root_device: int | None) -> dict[str, Any]:
+    try:
+        exists = path.exists()
+    except OSError:
+        exists = False
+    if not exists:
+        return {
+            "path": _public_host_path(path),
+            "exists": False,
+            "size_bytes": 0,
+            "entries_scanned": 0,
+            "permission_errors": 0,
+            "scan_errors": 0,
+            "skipped_different_filesystem": 0,
+            "truncated": False,
+        }
+
+    size = 0
+    entries_scanned = 0
+    permission_errors = 0
+    scan_errors = 0
+    skipped_different_filesystem = 0
+    truncated = False
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            current_stat = current.lstat()
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            permission_errors += 1
+            continue
+        except OSError:
+            scan_errors += 1
+            continue
+        if root_device is not None and current_stat.st_dev != root_device:
+            skipped_different_filesystem += 1
+            continue
+        size += _allocated_bytes(current_stat)
+        entries_scanned += 1
+        if entries_scanned >= max_entries:
+            truncated = True
+            break
+        if not stat.S_ISDIR(current_stat.st_mode):
+            continue
+        try:
+            with os.scandir(current) as children:
+                stack.extend(Path(child.path) for child in children)
+        except PermissionError:
+            permission_errors += 1
+        except FileNotFoundError:
+            continue
+        except OSError:
+            scan_errors += 1
+
+    return {
+        "path": _public_host_path(path),
+        "exists": True,
+        "size_bytes": size,
+        "entries_scanned": entries_scanned,
+        "permission_errors": permission_errors,
+        "scan_errors": scan_errors,
+        "skipped_different_filesystem": skipped_different_filesystem,
+        "truncated": truncated,
+    }
+
+
 def get_cpu_info() -> dict[str, Any]:
     """CPU utilization, core counts, and per-core percentages for this node."""
     return {
@@ -646,10 +795,45 @@ def get_disk_info() -> dict[str, Any]:
     return {"partitions": partitions}
 
 
+def get_filesystem_pressure() -> dict[str, Any]:
+    """Root filesystem runway, inode use, and configurable pressure thresholds.
+
+    This is the fast disk-pressure view for the node root mounted at ROOTFS. The
+    default thresholds are 80/85 percent because kubelet image garbage collection
+    starts to matter around that range on a single-filesystem k3s node.
+    """
+    return {"root": _filesystem_pressure("/")}
+
+
+def get_pressure_path_usage(
+    limit: int = 20, max_entries_per_path: int = _MAX_DU_ENTRIES
+) -> dict[str, Any]:
+    """Bounded usage scan for fixed host paths that commonly drive node pressure.
+
+    The caller can tune the result count and scan budget, but cannot pass an
+    arbitrary path. This keeps the tool useful for incidents without becoming a
+    root filesystem browser.
+    """
+    root = _host_path("/")
+    try:
+        root_device = root.stat().st_dev
+    except FileNotFoundError:
+        root_device = None
+    entry_budget = max(1, min(max_entries_per_path, _MAX_DU_ENTRIES))
+    paths = [_du_path(_host_path(path), entry_budget, root_device) for path in _PRESSURE_PATHS]
+    paths.sort(key=lambda item: item["size_bytes"], reverse=True)
+    return {
+        "paths": paths[: max(1, min(limit, 100))],
+        "configured_paths": list(_PRESSURE_PATHS),
+        "max_entries_per_path": entry_budget,
+        "same_filesystem_only": True,
+    }
+
+
 def get_network_info() -> dict[str, Any]:
     """Aggregate and per-interface network I/O counters for this node.
 
-    Reflects the node only when the pod runs with hostNetwork; otherwise these
+    Reflects the node only when the pod runs with hostNetwork. Otherwise these
     are the pod's own interface counters.
     """
     return {
@@ -715,12 +899,14 @@ def read_text_head(path: str, max_bytes: int = _MAX_READ_BYTES) -> dict[str, Any
 
 
 # Register each tool without rebinding its name, so the plain callables stay
-# directly invokable (tests call them; the mcp SDK's decorator return type has
+# directly invokable. Tests call them, and the mcp SDK's decorator return type has
 # varied across versions, so we don't rely on it).
 for _tool in (
     get_cpu_info,
     get_memory_info,
     get_disk_info,
+    get_filesystem_pressure,
+    get_pressure_path_usage,
     get_network_info,
     get_top_processes,
     get_system_snapshot,

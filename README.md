@@ -1,6 +1,6 @@
 # node-stats-mcp
 
-A node-local MCP battery. It reads the node it runs on - CPU, memory, disk, load, network, top processes, and bounded file metadata - and serves that over MCP (streamable-HTTP), so an agent can inspect a node without a host bind mount.
+A node-local MCP battery. It reads the node it runs on - CPU, memory, disk, disk-pressure runway, load, network, top processes, and bounded file metadata - and serves that over MCP (streamable-HTTP), so an agent can inspect a node without a host bind mount.
 
 This is the generic node-introspection spine, first instance of the upstream pattern: a per-node MCP agent, the same shape as node-exporter (DaemonSet-or-node-pinned + hostPath + host namespaces), but exposing a tool surface instead of Prometheus metrics.
 
@@ -20,7 +20,11 @@ The API read path prefers the host-mounted k3s admin kubeconfig at `/host/etc/ra
 
 ## Safety
 
-Read-only by construction: every tool is a read, none mutate the host. File introspection (`stat_path`, `read_text_head`) is **prefix-allowlisted** via `NODE_STATS_READABLE_ROOTS` (empty by default = file reads denied) and size-capped, so a tool can never be walked into `/host/root/.ssh`. Reach is gated at the network layer (the tailnet / node), not by the tool.
+Read-only by construction: every tool is a read, none mutate the host. File introspection (`stat_path`, `read_text_head`) is **prefix-allowlisted** via `NODE_STATS_READABLE_ROOTS` (empty by default = file reads denied) and size-capped, so a tool can never be walked into `/host/root/.ssh`. Disk pressure scans (`get_pressure_path_usage`) use a fixed configured path list, so callers cannot turn the MCP into a root filesystem browser. Reach is gated at the network layer (the tailnet / node), not by the tool.
+
+## Disk pressure
+
+`get_filesystem_pressure` reports root filesystem capacity, available bytes, inode use, and byte runway to configurable warning and critical thresholds. `get_pressure_path_usage` scans a bounded set of node-pressure paths such as logs, journald, kubelet, k3s, and containerd storage, with a per-path entry cap. Each path result includes size, entries scanned, permission errors, scan errors, skipped different-filesystem entries, and truncation state.
 
 ## Run it locally
 
