@@ -8,7 +8,7 @@ Living inventory of what ships from this repo. One image, one process: a FastMCP
 - **get_memory_info** - virtual and swap memory (bytes + percent).
 - **get_disk_info** - per-partition usage and mount info, resolved under `ROOTFS`.
 - **get_filesystem_pressure** - root filesystem capacity, available bytes, inode pressure, and byte runway to warning/critical thresholds.
-- **get_pressure_path_usage** - bounded usage scan over configured node-pressure paths such as logs, journald, kubelet, k3s, and containerd storage. Results include size, entries scanned, permission/scan errors, skipped different-filesystem entries, and truncation state.
+- **get_pressure_path_usage** - worker-thread usage scan over configured node-pressure paths such as logs, journald, kubelet, k3s, and containerd storage. Per-path, total-entry, and wall-clock caps keep other MCP tools responsive; results include size, entries scanned, permission/scan errors, skipped different-filesystem entries, timeout/truncation metadata, and coalesced nested paths.
 - **get_network_info** - aggregate and per-interface I/O counters (node-wide under hostNetwork).
 - **get_top_processes** - top N by cpu or memory (node-wide under hostPID).
 - **get_k3s_pods** - read-only namespace/pod/container inventory from the k3s API.
@@ -22,7 +22,7 @@ Living inventory of what ships from this repo. One image, one process: a FastMCP
 
 - **Read-only** - no tool mutates the host.
 - **Prefix-allowlisted file access** - `NODE_STATS_READABLE_ROOTS` (colon-separated, empty by default) gates `stat_path` / `read_text_head`. Paths resolve real (symlinks collapsed) and must sit under an allowed root. `NODE_STATS_MAX_READ_BYTES` caps read size.
-- **Fixed pressure scan paths** - `get_pressure_path_usage` only scans `NODE_STATS_PRESSURE_PATHS`, never a caller-supplied raw path, and caps traversal with `NODE_STATS_MAX_DU_ENTRIES`.
+- **Fixed pressure scan paths** - `get_pressure_path_usage` only scans `NODE_STATS_PRESSURE_PATHS`, never a caller-supplied raw path. Nested configured paths are skipped when an ancestor is already scanned, and traversal is capped per path, globally, and by wall clock.
 - **Network-gated reach** - the endpoint is meant to sit behind the tailnet / node boundary, not public.
 
 ## Configuration (env)
@@ -37,6 +37,8 @@ Living inventory of what ships from this repo. One image, one process: a FastMCP
 - `NODE_STATS_DISK_CRITICAL_PERCENT` (default 85).
 - `NODE_STATS_PRESSURE_PATHS` - colon-separated fixed paths for pressure scans, interpreted inside `ROOTFS`.
 - `NODE_STATS_MAX_DU_ENTRIES` (default 200000) - per-path traversal cap for pressure scans.
+- `NODE_STATS_MAX_DU_TOTAL_ENTRIES` (default 200000) - shared traversal cap across all pressure paths in one request.
+- `NODE_STATS_DU_TIMEOUT_SECONDS` (default 10) - wall-clock cap for one pressure-path scan; timeout is returned as metadata.
 
 ## Deploy
 

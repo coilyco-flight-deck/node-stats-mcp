@@ -18,6 +18,7 @@ generalized to a root allowlist, so the tool cannot be walked into /host/root/.s
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
@@ -78,6 +79,8 @@ _PRESSURE_PATHS = tuple(
     if p
 )
 _MAX_DU_ENTRIES = int(os.environ.get("NODE_STATS_MAX_DU_ENTRIES", "200000"))
+_MAX_DU_TOTAL_ENTRIES = int(os.environ.get("NODE_STATS_MAX_DU_TOTAL_ENTRIES", "200000"))
+_DU_TIMEOUT_SECONDS = float(os.environ.get("NODE_STATS_DU_TIMEOUT_SECONDS", "10"))
 
 mcp = FastMCP(
     "node-stats",
@@ -109,6 +112,15 @@ class _CgroupRefs:
     paths: list[str]
     pod_uid: str | None
     container_ids: list[str]
+
+
+@dataclass
+class _ScanBudget:
+    """Mutable limits shared by every path in one pressure scan."""
+
+    max_entries: int
+    deadline: float
+    entries_scanned: int = 0
 
 
 PodContainerMatch = tuple[dict[str, Any], dict[str, Any]]
@@ -691,71 +703,152 @@ def _filesystem_pressure(path: str) -> dict[str, Any]:
     }
 
 
-def _du_path(path: Path, max_entries: int, root_device: int | None) -> dict[str, Any]:
+def _scan_result(path: Path, exists: bool) -> dict[str, Any]:
+    return {
+        "path": _public_host_path(path),
+        "exists": exists,
+        "size_bytes": 0,
+        "entries_scanned": 0,
+        "permission_errors": 0,
+        "scan_errors": 0,
+        "errors": [],
+        "skipped_different_filesystem": 0,
+        "truncated": False,
+        "truncation_reason": None,
+        "timed_out": False,
+    }
+
+
+def _stop_reason(budget: _ScanBudget) -> str | None:
+    if time.monotonic() >= budget.deadline:
+        return "timeout"
+    if budget.entries_scanned >= budget.max_entries:
+        return "global_entry_budget"
+    return None
+
+
+def _record_scan_error(result: dict[str, Any], exc: OSError) -> None:
+    result["scan_errors"] += 1
+    if len(result["errors"]) < 10:
+        result["errors"].append(str(exc))
+
+
+def _du_path(
+    path: Path, max_entries: int, root_device: int | None, budget: _ScanBudget
+) -> dict[str, Any]:
     try:
         exists = path.exists()
-    except OSError:
+    except OSError as exc:
         exists = False
+        result = _scan_result(path, exists=False)
+        _record_scan_error(result, exc)
+        return result
     if not exists:
-        return {
-            "path": _public_host_path(path),
-            "exists": False,
-            "size_bytes": 0,
-            "entries_scanned": 0,
-            "permission_errors": 0,
-            "scan_errors": 0,
-            "skipped_different_filesystem": 0,
-            "truncated": False,
-        }
+        return _scan_result(path, exists=False)
 
-    size = 0
-    entries_scanned = 0
-    permission_errors = 0
-    scan_errors = 0
-    skipped_different_filesystem = 0
-    truncated = False
+    result = _scan_result(path, exists=True)
     stack = [path]
     while stack:
+        if reason := _stop_reason(budget):
+            result["truncated"] = True
+            result["truncation_reason"] = reason
+            result["timed_out"] = reason == "timeout"
+            break
         current = stack.pop()
         try:
             current_stat = current.lstat()
         except FileNotFoundError:
             continue
         except PermissionError:
-            permission_errors += 1
+            result["permission_errors"] += 1
             continue
-        except OSError:
-            scan_errors += 1
+        except OSError as exc:
+            _record_scan_error(result, exc)
             continue
         if root_device is not None and current_stat.st_dev != root_device:
-            skipped_different_filesystem += 1
+            result["skipped_different_filesystem"] += 1
             continue
-        size += _allocated_bytes(current_stat)
-        entries_scanned += 1
-        if entries_scanned >= max_entries:
-            truncated = True
+        result["size_bytes"] += _allocated_bytes(current_stat)
+        result["entries_scanned"] += 1
+        budget.entries_scanned += 1
+        if result["entries_scanned"] >= max_entries:
+            result["truncated"] = True
+            result["truncation_reason"] = "per_path_entry_cap"
+            break
+        if budget.entries_scanned >= budget.max_entries:
+            result["truncated"] = True
+            result["truncation_reason"] = "global_entry_budget"
             break
         if not stat.S_ISDIR(current_stat.st_mode):
             continue
         try:
             with os.scandir(current) as children:
-                stack.extend(Path(child.path) for child in children)
+                for child in children:
+                    if reason := _stop_reason(budget):
+                        result["truncated"] = True
+                        result["truncation_reason"] = reason
+                        result["timed_out"] = reason == "timeout"
+                        break
+                    stack.append(Path(child.path))
         except PermissionError:
-            permission_errors += 1
+            result["permission_errors"] += 1
         except FileNotFoundError:
             continue
-        except OSError:
-            scan_errors += 1
+        except OSError as exc:
+            _record_scan_error(result, exc)
 
+    return result
+
+
+def _coalesced_pressure_paths() -> tuple[list[Path], list[dict[str, str]]]:
+    """Keep only shallow fixed roots so nested paths are not scanned twice."""
+    configured = [(_host_path(path), path) for path in _PRESSURE_PATHS]
+    selected: list[Path] = []
+    skipped: list[dict[str, str]] = []
+    for path, configured_path in sorted(configured, key=lambda item: len(item[0].parts)):
+        parent = next((candidate for candidate in selected if candidate in path.parents), None)
+        if parent is None and path not in selected:
+            selected.append(path)
+            continue
+        skipped.append(
+            {
+                "path": configured_path,
+                "covered_by": _public_host_path(parent if parent is not None else path),
+            }
+        )
+    return selected, skipped
+
+
+def _pressure_path_usage(limit: int, max_entries_per_path: int) -> dict[str, Any]:
+    """Run the fixed-path traversal in a worker thread with shared limits."""
+    root = _host_path("/")
+    try:
+        root_device = root.stat().st_dev
+    except FileNotFoundError:
+        root_device = None
+    entry_budget = max(1, min(max_entries_per_path, _MAX_DU_ENTRIES))
+    total_budget = max(1, _MAX_DU_TOTAL_ENTRIES)
+    timeout_seconds = max(0.001, _DU_TIMEOUT_SECONDS)
+    budget = _ScanBudget(
+        max_entries=total_budget,
+        deadline=time.monotonic() + timeout_seconds,
+    )
+    scan_paths, skipped_nested_paths = _coalesced_pressure_paths()
+    paths = [_du_path(path, entry_budget, root_device, budget) for path in scan_paths]
+    paths.sort(key=lambda item: item["size_bytes"], reverse=True)
+    timed_out = any(path["timed_out"] for path in paths)
     return {
-        "path": _public_host_path(path),
-        "exists": True,
-        "size_bytes": size,
-        "entries_scanned": entries_scanned,
-        "permission_errors": permission_errors,
-        "scan_errors": scan_errors,
-        "skipped_different_filesystem": skipped_different_filesystem,
-        "truncated": truncated,
+        "paths": paths[: max(1, min(limit, 100))],
+        "configured_paths": list(_PRESSURE_PATHS),
+        "skipped_nested_paths": skipped_nested_paths,
+        "max_entries_per_path": entry_budget,
+        "max_total_entries": total_budget,
+        "total_entries_scanned": budget.entries_scanned,
+        "timeout_seconds": timeout_seconds,
+        "timed_out": timed_out,
+        "truncated": any(path["truncated"] for path in paths),
+        "scan_errors": sum(path["scan_errors"] for path in paths),
+        "same_filesystem_only": True,
     }
 
 
@@ -805,29 +898,18 @@ def get_filesystem_pressure() -> dict[str, Any]:
     return {"root": _filesystem_pressure("/")}
 
 
-def get_pressure_path_usage(
+async def get_pressure_path_usage(
     limit: int = 20, max_entries_per_path: int = _MAX_DU_ENTRIES
 ) -> dict[str, Any]:
     """Bounded usage scan for fixed host paths that commonly drive node pressure.
 
-    The caller can tune the result count and scan budget, but cannot pass an
-    arbitrary path. This keeps the tool useful for incidents without becoming a
-    root filesystem browser.
+    Traversal runs in a worker thread, leaving the MCP event loop available for
+    fast tools such as get_filesystem_pressure. Per-path, total-entry, and
+    wall-clock limits return truncation, timeout, and error metadata. Nested
+    configured paths are coalesced so the same tree is not walked twice. The
+    caller can tune only the per-path cap and result count, never a raw path.
     """
-    root = _host_path("/")
-    try:
-        root_device = root.stat().st_dev
-    except FileNotFoundError:
-        root_device = None
-    entry_budget = max(1, min(max_entries_per_path, _MAX_DU_ENTRIES))
-    paths = [_du_path(_host_path(path), entry_budget, root_device) for path in _PRESSURE_PATHS]
-    paths.sort(key=lambda item: item["size_bytes"], reverse=True)
-    return {
-        "paths": paths[: max(1, min(limit, 100))],
-        "configured_paths": list(_PRESSURE_PATHS),
-        "max_entries_per_path": entry_budget,
-        "same_filesystem_only": True,
-    }
+    return await asyncio.to_thread(_pressure_path_usage, limit, max_entries_per_path)
 
 
 def get_network_info() -> dict[str, Any]:

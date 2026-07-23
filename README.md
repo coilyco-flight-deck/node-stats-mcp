@@ -24,7 +24,7 @@ Read-only by construction: every tool is a read, none mutate the host. File intr
 
 ## Disk pressure
 
-`get_filesystem_pressure` reports root filesystem capacity, available bytes, inode use, and byte runway to configurable warning and critical thresholds. `get_pressure_path_usage` scans a bounded set of node-pressure paths such as logs, journald, kubelet, k3s, and containerd storage, with a per-path entry cap. Each path result includes size, entries scanned, permission errors, scan errors, skipped different-filesystem entries, and truncation state.
+`get_filesystem_pressure` reports root filesystem capacity, available bytes, inode use, and byte runway to configurable warning and critical thresholds. `get_pressure_path_usage` scans a fixed, bounded set of node-pressure paths such as logs, journald, kubelet, k3s, and containerd storage. Traversal runs in a worker thread, so fast tools remain responsive. Per-path and shared total-entry caps plus a wall-clock limit return explicit scan-error, truncation, and timeout metadata. Nested configured paths are coalesced, with skipped overlaps reported instead of walking the same subtree twice.
 
 ## Run it locally
 

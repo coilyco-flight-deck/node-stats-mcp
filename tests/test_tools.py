@@ -8,7 +8,10 @@ cannot be escaped.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
+import threading
+import time
 from pathlib import Path
 from types import ModuleType
 
@@ -21,6 +24,8 @@ def _load(
     roots: str,
     pressure_paths: str | None = None,
     max_du_entries: str | None = None,
+    max_du_total_entries: str | None = None,
+    du_timeout_seconds: str | None = None,
 ) -> ModuleType:
     """Reimport the server module with ROOTFS + allowlist env applied at import time."""
     monkeypatch.setenv("ROOTFS", tmp_root)
@@ -35,6 +40,14 @@ def _load(
         monkeypatch.delenv("NODE_STATS_MAX_DU_ENTRIES", raising=False)
     else:
         monkeypatch.setenv("NODE_STATS_MAX_DU_ENTRIES", max_du_entries)
+    if max_du_total_entries is None:
+        monkeypatch.delenv("NODE_STATS_MAX_DU_TOTAL_ENTRIES", raising=False)
+    else:
+        monkeypatch.setenv("NODE_STATS_MAX_DU_TOTAL_ENTRIES", max_du_total_entries)
+    if du_timeout_seconds is None:
+        monkeypatch.delenv("NODE_STATS_DU_TIMEOUT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("NODE_STATS_DU_TIMEOUT_SECONDS", du_timeout_seconds)
     import node_stats_mcp.server as server
 
     return importlib.reload(server)
@@ -108,7 +121,7 @@ def test_pressure_path_usage_uses_fixed_env_paths(
     (tmp_path / "cold" / "tiny.txt").write_text("x")
     server = _load(monkeypatch, str(tmp_path), "", pressure_paths="/hot:/cold:/missing")
 
-    got = server.get_pressure_path_usage(limit=10, max_entries_per_path=1000)
+    got = asyncio.run(server.get_pressure_path_usage(limit=10, max_entries_per_path=1000))
     by_path = {entry["path"]: entry for entry in got["paths"]}
 
     assert got["configured_paths"] == ["/hot", "/cold", "/missing"]
@@ -133,13 +146,118 @@ def test_pressure_path_usage_caps_entries(monkeypatch: pytest.MonkeyPatch, tmp_p
         max_du_entries="3",
     )
 
-    got = server.get_pressure_path_usage(limit=1, max_entries_per_path=1000)
+    got = asyncio.run(server.get_pressure_path_usage(limit=1, max_entries_per_path=1000))
     path = got["paths"][0]
 
     assert got["max_entries_per_path"] == 3
     assert path["path"] == "/hot"
     assert path["entries_scanned"] == 3
     assert path["truncated"] is True
+    assert path["truncation_reason"] == "per_path_entry_cap"
+
+
+def test_pressure_path_usage_caps_total_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    for name in ("hot", "cold"):
+        directory = tmp_path / name
+        directory.mkdir()
+        for idx in range(5):
+            (directory / f"{idx}.txt").write_text("x")
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        pressure_paths="/hot:/cold",
+        max_du_entries="100",
+        max_du_total_entries="4",
+    )
+
+    got = asyncio.run(server.get_pressure_path_usage(limit=10, max_entries_per_path=100))
+
+    assert got["max_total_entries"] == 4
+    assert got["total_entries_scanned"] == 4
+    assert got["truncated"] is True
+    assert any(path["truncation_reason"] == "global_entry_budget" for path in got["paths"])
+
+
+def test_pressure_path_usage_reports_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    directory = tmp_path / "hot"
+    directory.mkdir()
+    (directory / "slow.txt").write_text("x")
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        pressure_paths="/hot",
+        du_timeout_seconds="0.001",
+    )
+    original_scandir = server.os.scandir
+
+    def slow_scandir(path):
+        time.sleep(0.02)
+        return original_scandir(path)
+
+    monkeypatch.setattr(server.os, "scandir", slow_scandir)
+
+    got = asyncio.run(server.get_pressure_path_usage(limit=1, max_entries_per_path=100))
+
+    assert got["timed_out"] is True
+    assert got["truncated"] is True
+    assert got["paths"][0]["timed_out"] is True
+    assert got["paths"][0]["truncation_reason"] == "timeout"
+
+
+def test_pressure_path_usage_coalesces_nested_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    nested = tmp_path / "hot" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "payload.txt").write_text("x")
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        pressure_paths="/hot/nested:/hot",
+    )
+
+    got = asyncio.run(server.get_pressure_path_usage(limit=10, max_entries_per_path=100))
+
+    assert [path["path"] for path in got["paths"]] == ["/hot"]
+    assert got["skipped_nested_paths"] == [{"path": "/hot/nested", "covered_by": "/hot"}]
+
+
+def test_filesystem_pressure_stays_responsive_during_path_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    directory = tmp_path / "hot"
+    directory.mkdir()
+    (directory / "payload.txt").write_text("x")
+    server = _load(monkeypatch, str(tmp_path), "", pressure_paths="/hot")
+    original_du_path = server._du_path
+    scan_started = threading.Event()
+
+    def slow_du_path(*args, **kwargs):
+        scan_started.set()
+        time.sleep(0.25)
+        return original_du_path(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_du_path", slow_du_path)
+
+    async def run_concurrently() -> float:
+        scan = asyncio.create_task(
+            server.get_pressure_path_usage(limit=1, max_entries_per_path=100)
+        )
+        assert await asyncio.to_thread(scan_started.wait, 1)
+        started = time.monotonic()
+        assert server.get_filesystem_pressure()["root"]["total_bytes"] > 0
+        elapsed = time.monotonic() - started
+        await scan
+        return elapsed
+
+    assert asyncio.run(run_concurrently()) < 0.1
 
 
 def test_top_processes_validates_sort(monkeypatch: pytest.MonkeyPatch) -> None:
