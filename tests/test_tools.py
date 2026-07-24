@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import threading
 import time
 from pathlib import Path
@@ -26,6 +27,8 @@ def _load(
     max_du_entries: str | None = None,
     max_du_total_entries: str | None = None,
     du_timeout_seconds: str | None = None,
+    k3s_volume_roots: str | None = None,
+    max_k3s_volume_paths: str | None = None,
 ) -> ModuleType:
     """Reimport the server module with ROOTFS + allowlist env applied at import time."""
     monkeypatch.setenv("ROOTFS", tmp_root)
@@ -48,6 +51,14 @@ def _load(
         monkeypatch.delenv("NODE_STATS_DU_TIMEOUT_SECONDS", raising=False)
     else:
         monkeypatch.setenv("NODE_STATS_DU_TIMEOUT_SECONDS", du_timeout_seconds)
+    if k3s_volume_roots is None:
+        monkeypatch.delenv("NODE_STATS_K3S_VOLUME_ROOTS", raising=False)
+    else:
+        monkeypatch.setenv("NODE_STATS_K3S_VOLUME_ROOTS", k3s_volume_roots)
+    if max_k3s_volume_paths is None:
+        monkeypatch.delenv("NODE_STATS_MAX_K3S_VOLUME_PATHS", raising=False)
+    else:
+        monkeypatch.setenv("NODE_STATS_MAX_K3S_VOLUME_PATHS", max_k3s_volume_paths)
     import node_stats_mcp.server as server
 
     return importlib.reload(server)
@@ -424,3 +435,205 @@ def test_k3s_container_memory_falls_back_to_cgroup_rss(monkeypatch: pytest.Monke
     got = server.get_k3s_container_memory()
     assert got["source"] == "cgroup-rss"
     assert got["containers"][0]["memory_bytes"] == 3072
+
+
+def _k3s_volume_api_items(claims: list[tuple[str, str]]) -> dict[str, list[dict]]:
+    pods: list[dict] = []
+    pvcs: list[dict] = []
+    pvs: list[dict] = []
+    for index, (claim_name, local_path) in enumerate(claims):
+        volume_name = f"volume-{index}"
+        pods.append(
+            {
+                "metadata": {
+                    "name": f"pod-{index}",
+                    "namespace": "apps",
+                    "uid": f"pod-uid-{index}",
+                },
+                "spec": {
+                    "volumes": [
+                        {
+                            "name": "data",
+                            "persistentVolumeClaim": {"claimName": claim_name},
+                        }
+                    ],
+                    "containers": [
+                        {
+                            "name": "app",
+                            "volumeMounts": [
+                                {
+                                    "name": "data",
+                                    "mountPath": "/data",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                "status": {"phase": "Running"},
+            }
+        )
+        pvcs.append(
+            {
+                "metadata": {
+                    "name": claim_name,
+                    "namespace": "apps",
+                    "uid": f"claim-uid-{index}",
+                },
+                "spec": {
+                    "volumeName": volume_name,
+                    "storageClassName": "local-path",
+                    "resources": {"requests": {"storage": "1Gi"}},
+                },
+                "status": {"phase": "Bound", "capacity": {"storage": "1Gi"}},
+            }
+        )
+        pvs.append(
+            {
+                "metadata": {
+                    "name": volume_name,
+                    "uid": f"volume-uid-{index}",
+                },
+                "spec": {
+                    "claimRef": {
+                        "namespace": "apps",
+                        "name": claim_name,
+                    },
+                    "storageClassName": "local-path",
+                    "capacity": {"storage": "1Gi"},
+                    "hostPath": {"path": local_path},
+                },
+                "status": {"phase": "Bound"},
+            }
+        )
+    return {
+        "/api/v1/pods": pods,
+        "/api/v1/persistentvolumeclaims": pvcs,
+        "/api/v1/persistentvolumes": pvs,
+    }
+
+
+def test_k3s_volume_usage_joins_pvcs_pvs_and_pod_mounts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    volume_root = tmp_path / "volumes"
+    claim_path = volume_root / "claim-a"
+    orphan_path = volume_root / "orphan"
+    claim_path.mkdir(parents=True)
+    orphan_path.mkdir()
+    (claim_path / "payload.bin").write_bytes(b"x" * 4096)
+    (orphan_path / "payload.bin").write_bytes(b"x" * 1024)
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        k3s_volume_roots="volumes",
+    )
+    api_items = _k3s_volume_api_items([("claim-a", "volumes/claim-a")])
+    second_pod = {
+        **api_items["/api/v1/pods"][0],
+        "metadata": {
+            "name": "pod-shared",
+            "namespace": "apps",
+            "uid": "pod-uid-shared",
+        },
+    }
+    api_items["/api/v1/pods"].append(second_pod)
+    monkeypatch.setattr(server, "_k8s_list", lambda path: (api_items[path], []))
+
+    got = asyncio.run(server.get_k3s_volume_usage(limit=10, max_entries_per_volume=1000))
+    volume = got["volumes"][0]
+
+    assert got["errors"] == []
+    assert volume["namespace"] == "apps"
+    assert volume["persistent_volume_claim"] == "claim-a"
+    assert volume["persistent_volume"] == "volume-0"
+    assert volume["storage_class"] == "local-path"
+    assert volume["requested_bytes"] == 1024**3
+    assert volume["capacity_bytes"] == 1024**3
+    assert volume["scan_status"] == "scanned"
+    assert volume["usage"]["size_bytes"] > 0
+    assert {mount["pod"] for mount in volume["pod_mounts"]} == {"pod-0", "pod-shared"}
+    assert {mount["mount_path"] for mount in volume["pod_mounts"]} == {"/data"}
+    assert got["namespaces"][0]["used_bytes"] == volume["usage"]["size_bytes"]
+    assert got["namespaces"][0]["pod_count"] == 2
+    assert got["unattributed_paths"][0]["path"].replace("\\", "/").endswith("/volumes/orphan")
+
+
+def test_k3s_volume_usage_rejects_paths_outside_fixed_roots(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "volumes").mkdir()
+    outside = tmp_path / "outside" / "claim-a"
+    outside.mkdir(parents=True)
+    (outside / "payload.bin").write_bytes(b"x" * 4096)
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        k3s_volume_roots="volumes",
+    )
+    api_items = _k3s_volume_api_items([("claim-a", "outside/claim-a")])
+    monkeypatch.setattr(server, "_k8s_list", lambda path: (api_items[path], []))
+
+    got = asyncio.run(server.get_k3s_volume_usage())
+    volume = got["volumes"][0]
+
+    assert "path" not in inspect.signature(server.get_k3s_volume_usage).parameters
+    assert volume["scan_status"] == "outside_configured_roots"
+    assert volume["usage"] is None
+    assert "local_path" not in volume
+    assert got["paths_scanned"] == 0
+
+
+def test_k3s_volume_usage_shares_scan_budget_fairly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    volume_root = tmp_path / "volumes"
+    claims = []
+    for claim_name in ("claim-a", "claim-b"):
+        claim_path = volume_root / claim_name
+        claim_path.mkdir(parents=True)
+        for index in range(10):
+            (claim_path / f"{index}.bin").write_bytes(b"x")
+        claims.append((claim_name, f"volumes/{claim_name}"))
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        max_du_total_entries="6",
+        k3s_volume_roots="volumes",
+    )
+    api_items = _k3s_volume_api_items(claims)
+    monkeypatch.setattr(server, "_k8s_list", lambda path: (api_items[path], []))
+
+    got = asyncio.run(server.get_k3s_volume_usage(limit=10, max_entries_per_volume=100))
+
+    assert got["total_entries_scanned"] == 6
+    assert got["max_entries_per_volume"] == 3
+    assert all(volume["usage"]["entries_scanned"] == 3 for volume in got["volumes"])
+    assert all(volume["usage"]["truncated"] is True for volume in got["volumes"])
+
+
+def test_k3s_volume_usage_keeps_fast_tools_responsive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    server = _load(monkeypatch, str(tmp_path), "", k3s_volume_roots="volumes")
+    scan_started = threading.Event()
+
+    def slow_volume_usage(*args, **kwargs):
+        scan_started.set()
+        time.sleep(0.25)
+        return {"volumes": []}
+
+    monkeypatch.setattr(server, "_k3s_volume_usage", slow_volume_usage)
+
+    async def run_concurrently() -> float:
+        scan = asyncio.create_task(server.get_k3s_volume_usage())
+        assert await asyncio.to_thread(scan_started.wait, 1)
+        started = time.monotonic()
+        assert server.get_filesystem_pressure()["root"]["total_bytes"] > 0
+        elapsed = time.monotonic() - started
+        await scan
+        return elapsed
+
+    assert asyncio.run(run_concurrently()) < 0.1

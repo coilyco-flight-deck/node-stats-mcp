@@ -54,6 +54,15 @@ _READABLE_ROOTS = [r for r in os.environ.get("NODE_STATS_READABLE_ROOTS", "").sp
 _MAX_READ_BYTES = int(os.environ.get("NODE_STATS_MAX_READ_BYTES", "65536"))
 _K8S_TIMEOUT_SECONDS = float(os.environ.get("NODE_STATS_K8S_TIMEOUT_SECONDS", "3"))
 _KUBECONFIG_PATH = os.environ.get("NODE_STATS_KUBECONFIG", "/etc/rancher/k3s/k3s.yaml")
+_DEFAULT_K3S_VOLUME_ROOTS = ("/var/lib/rancher/k3s/storage",)
+_K3S_VOLUME_ROOTS = tuple(
+    path
+    for path in os.environ.get(
+        "NODE_STATS_K3S_VOLUME_ROOTS", ":".join(_DEFAULT_K3S_VOLUME_ROOTS)
+    ).split(":")
+    if path
+)
+_MAX_K3S_VOLUME_PATHS = int(os.environ.get("NODE_STATS_MAX_K3S_VOLUME_PATHS", "1000"))
 
 _DISK_WARN_PERCENT = float(os.environ.get("NODE_STATS_DISK_WARN_PERCENT", "80"))
 _DISK_CRITICAL_PERCENT = float(os.environ.get("NODE_STATS_DISK_CRITICAL_PERCENT", "85"))
@@ -136,15 +145,18 @@ def _strip_quotes(value: str) -> str:
 
 
 def _host_path(path: str | Path) -> Path:
-    candidate = Path(path)
-    if candidate.is_absolute():
-        root = Path(ROOTFS)
+    raw_path = os.fspath(path)
+    candidate = Path(raw_path)
+    root = Path(ROOTFS)
+    if raw_path.startswith("/"):
         try:
             candidate.relative_to(root)
         except ValueError:
-            return root.joinpath(candidate.relative_to("/"))
+            return root.joinpath(raw_path.lstrip("/"))
         return candidate
-    return Path(ROOTFS).joinpath(candidate)
+    if candidate.is_absolute():
+        return candidate
+    return root.joinpath(candidate)
 
 
 def _read_host_text(path: str | Path) -> str | None:
@@ -464,6 +476,95 @@ def _k8s_pod_inventory() -> tuple[list[dict[str, Any]], PodContainerIndex, PodUi
     return pods, by_container_id, by_pod_uid, errors
 
 
+def _pod_pvc_mounts(items: list[dict[str, Any]]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    mounts: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for item in items:
+        metadata = item.get("metadata", {})
+        spec = item.get("spec", {})
+        status = item.get("status", {})
+        namespace = metadata.get("namespace")
+        pod = metadata.get("name")
+        if not namespace or not pod:
+            continue
+        claims_by_volume: dict[str, str] = {}
+        for volume in spec.get("volumes", []):
+            if not isinstance(volume, dict):
+                continue
+            claim = volume.get("persistentVolumeClaim")
+            if not isinstance(claim, dict):
+                continue
+            volume_name = volume.get("name")
+            claim_name = claim.get("claimName")
+            if volume_name and claim_name:
+                claims_by_volume[str(volume_name)] = str(claim_name)
+        for container_type, containers in (
+            ("container", spec.get("containers", [])),
+            ("init_container", spec.get("initContainers", [])),
+            ("ephemeral_container", spec.get("ephemeralContainers", [])),
+        ):
+            for container in containers:
+                if not isinstance(container, dict):
+                    continue
+                for mount in container.get("volumeMounts", []):
+                    if not isinstance(mount, dict):
+                        continue
+                    volume_name = mount.get("name")
+                    claim_name = claims_by_volume.get(str(volume_name))
+                    if not claim_name:
+                        continue
+                    mounts[(str(namespace), claim_name)].append(
+                        {
+                            "pod": str(pod),
+                            "pod_uid": _pod_uid_from_item(item),
+                            "phase": status.get("phase"),
+                            "container": container.get("name"),
+                            "container_type": container_type,
+                            "volume": volume_name,
+                            "mount_path": mount.get("mountPath"),
+                            "read_only": bool(mount.get("readOnly")),
+                        }
+                    )
+    return mounts
+
+
+def _normalize_pvc(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata", {})
+    spec = item.get("spec", {})
+    status = item.get("status", {})
+    return {
+        "namespace": metadata.get("namespace"),
+        "persistent_volume_claim": metadata.get("name"),
+        "persistent_volume_claim_uid": metadata.get("uid"),
+        "persistent_volume": spec.get("volumeName"),
+        "storage_class": spec.get("storageClassName"),
+        "phase": status.get("phase"),
+        "requested_bytes": _parse_quantity(
+            spec.get("resources", {}).get("requests", {}).get("storage")
+        ),
+        "capacity_bytes": _parse_quantity(status.get("capacity", {}).get("storage")),
+    }
+
+
+def _normalize_pv(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata", {})
+    spec = item.get("spec", {})
+    status = item.get("status", {})
+    claim = spec.get("claimRef", {})
+    host_path = spec.get("hostPath", {}).get("path")
+    local_path = spec.get("local", {}).get("path")
+    return {
+        "persistent_volume": metadata.get("name"),
+        "persistent_volume_uid": metadata.get("uid"),
+        "namespace": claim.get("namespace"),
+        "persistent_volume_claim": claim.get("name"),
+        "storage_class": spec.get("storageClassName"),
+        "phase": status.get("phase"),
+        "capacity_bytes": _parse_quantity(spec.get("capacity", {}).get("storage")),
+        "local_path": host_path or local_path,
+        "local_path_source": "hostPath" if host_path else "local" if local_path else None,
+    }
+
+
 def _match_pod_container(
     refs: _CgroupRefs,
     by_container_id: PodContainerIndex,
@@ -629,6 +730,18 @@ def get_k3s_process_attribution(limit: int = 10, sort_by: str = "memory") -> dic
     return {"sort_by": sort_by, "processes": processes[:cap], "errors": errors}
 
 
+async def get_k3s_volume_usage(
+    limit: int = 20, max_entries_per_volume: int = _MAX_DU_ENTRIES
+) -> dict[str, Any]:
+    """Bounded local-volume disk usage joined to PVCs, PVs, namespaces, and pod mounts.
+
+    The server scans only local paths beneath NODE_STATS_K3S_VOLUME_ROOTS. Callers
+    can tune result and entry caps but cannot supply a filesystem path. The API
+    reads and traversal run in a worker thread so fast node tools stay responsive.
+    """
+    return await asyncio.to_thread(_k3s_volume_usage, limit, max_entries_per_volume)
+
+
 def _allowed_roots() -> list[Path]:
     return [Path(ROOTFS).joinpath(r.lstrip("/")).resolve() for r in _READABLE_ROOTS]
 
@@ -660,21 +773,37 @@ def _public_host_path(path: Path) -> str:
         relative = path.relative_to(Path(ROOTFS))
     except ValueError:
         return str(path)
-    return "/" + str(relative)
+    return "/" + relative.as_posix()
 
 
 def _filesystem_pressure(path: str) -> dict[str, Any]:
     target = _host_path(path)
-    fs = os.statvfs(target)
-    total = fs.f_frsize * fs.f_blocks
-    free = fs.f_frsize * fs.f_bfree
-    available = fs.f_frsize * fs.f_bavail
-    reserved = free - available
+    statvfs = getattr(os, "statvfs", None)
+    if statvfs is None:
+        disk = psutil.disk_usage(str(target))
+        total = disk.total
+        free = disk.free
+        available = disk.free
+        reserved = 0
+        inodes_total = 0
+        inodes_free = 0
+        inodes_available = 0
+    else:
+        fs = statvfs(target)
+        total = fs.f_frsize * fs.f_blocks
+        free = fs.f_frsize * fs.f_bfree
+        available = fs.f_frsize * fs.f_bavail
+        reserved = free - available
+        inodes_total = fs.f_files
+        inodes_free = fs.f_ffree
+        inodes_available = fs.f_favail
     pressure_used = total - available
     used_percent = (pressure_used / total * 100.0) if total else 0.0
     warn_used = int(total * (_DISK_WARN_PERCENT / 100.0))
     critical_used = int(total * (_DISK_CRITICAL_PERCENT / 100.0))
-    inode_percent = ((fs.f_files - fs.f_favail) / fs.f_files) * 100.0 if fs.f_files else 0.0
+    inode_percent = (
+        ((inodes_total - inodes_available) / inodes_total) * 100.0 if inodes_total else 0.0
+    )
     if used_percent >= _DISK_CRITICAL_PERCENT:
         status = "critical"
     elif used_percent >= _DISK_WARN_PERCENT:
@@ -696,9 +825,9 @@ def _filesystem_pressure(path: str) -> dict[str, Any]:
         "bytes_until_critical": critical_used - pressure_used,
         "bytes_over_warn": max(0, pressure_used - warn_used),
         "bytes_over_critical": max(0, pressure_used - critical_used),
-        "inodes_total": fs.f_files,
-        "inodes_free": fs.f_ffree,
-        "inodes_available": fs.f_favail,
+        "inodes_total": inodes_total,
+        "inodes_free": inodes_free,
+        "inodes_available": inodes_available,
         "inodes_used_percent": inode_percent,
     }
 
@@ -852,6 +981,281 @@ def _pressure_path_usage(limit: int, max_entries_per_path: int) -> dict[str, Any
     }
 
 
+def _resolved_k3s_volume_roots() -> list[Path]:
+    roots: list[Path] = []
+    for configured in _K3S_VOLUME_ROOTS:
+        root = _host_path(configured).resolve()
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _safe_k3s_volume_path(path: str | None, roots: list[Path]) -> Path | None:
+    if not path:
+        return None
+    candidate = _host_path(path).resolve()
+    if any(root in candidate.parents for root in roots):
+        return candidate
+    return None
+
+
+def _k3s_volume_root_children(
+    roots: list[Path],
+) -> tuple[list[Path], list[str], bool]:
+    children: list[Path] = []
+    errors: list[str] = []
+    truncated = False
+    cap = max(1, _MAX_K3S_VOLUME_PATHS)
+    for root in roots:
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    child = Path(entry.path).resolve()
+                    if root not in child.parents:
+                        continue
+                    if len(children) >= cap:
+                        truncated = True
+                        break
+                    children.append(child)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append(f"{_public_host_path(root)}: {exc}")
+    children.sort(key=str)
+    return children, errors, truncated
+
+
+def _k3s_volume_inventory() -> tuple[list[dict[str, Any]], list[str]]:
+    pod_items, pod_errors = _k8s_list("/api/v1/pods")
+    pvc_items, pvc_errors = _k8s_list("/api/v1/persistentvolumeclaims")
+    pv_items, pv_errors = _k8s_list("/api/v1/persistentvolumes")
+    errors = [
+        *(f"pods: {error}" for error in pod_errors),
+        *(f"persistent volume claims: {error}" for error in pvc_errors),
+        *(f"persistent volumes: {error}" for error in pv_errors),
+    ]
+    mounts = _pod_pvc_mounts(pod_items)
+    pv_by_name = {
+        str(pv["persistent_volume"]): pv
+        for item in pv_items
+        if (pv := _normalize_pv(item))["persistent_volume"]
+    }
+    volumes: list[dict[str, Any]] = []
+    claimed_pvs: set[str] = set()
+    for item in pvc_items:
+        pvc = _normalize_pvc(item)
+        namespace = pvc["namespace"]
+        claim_name = pvc["persistent_volume_claim"]
+        pv_name = pvc["persistent_volume"]
+        pv = pv_by_name.get(str(pv_name), {}) if pv_name else {}
+        if pv_name:
+            claimed_pvs.add(str(pv_name))
+        mount_key = (str(namespace), str(claim_name))
+        volumes.append(
+            {
+                "namespace": namespace,
+                "persistent_volume_claim": claim_name,
+                "persistent_volume_claim_uid": pvc["persistent_volume_claim_uid"],
+                "persistent_volume": pv_name,
+                "persistent_volume_uid": pv.get("persistent_volume_uid"),
+                "storage_class": pvc["storage_class"] or pv.get("storage_class"),
+                "pvc_phase": pvc["phase"],
+                "pv_phase": pv.get("phase"),
+                "requested_bytes": pvc["requested_bytes"],
+                "capacity_bytes": pvc["capacity_bytes"] or pv.get("capacity_bytes"),
+                "local_path_source": pv.get("local_path_source"),
+                "pod_mounts": mounts.get(mount_key, []),
+                "_candidate_local_path": pv.get("local_path"),
+            }
+        )
+    for pv_name, pv in pv_by_name.items():
+        if pv_name in claimed_pvs:
+            continue
+        namespace = pv["namespace"]
+        claim_name = pv["persistent_volume_claim"]
+        mount_key = (str(namespace), str(claim_name))
+        volumes.append(
+            {
+                "namespace": namespace,
+                "persistent_volume_claim": claim_name,
+                "persistent_volume_claim_uid": None,
+                "persistent_volume": pv_name,
+                "persistent_volume_uid": pv["persistent_volume_uid"],
+                "storage_class": pv["storage_class"],
+                "pvc_phase": None,
+                "pv_phase": pv["phase"],
+                "requested_bytes": None,
+                "capacity_bytes": pv["capacity_bytes"],
+                "local_path_source": pv["local_path_source"],
+                "pod_mounts": mounts.get(mount_key, []),
+                "_candidate_local_path": pv["local_path"],
+            }
+        )
+    volumes.sort(
+        key=lambda volume: (
+            str(volume.get("namespace") or ""),
+            str(volume.get("persistent_volume_claim") or ""),
+            str(volume.get("persistent_volume") or ""),
+        )
+    )
+    return volumes, errors
+
+
+def _scan_k3s_volume_paths(
+    paths: list[Path], max_entries_per_volume: int
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    if not paths:
+        return {}, {
+            "max_entries_per_volume": 0,
+            "max_total_entries": max(1, _MAX_DU_TOTAL_ENTRIES),
+            "total_entries_scanned": 0,
+            "timeout_seconds": max(0.001, _DU_TIMEOUT_SECONDS),
+            "time_slice_seconds": 0.0,
+            "timed_out": False,
+            "truncated": False,
+            "scan_errors": 0,
+        }
+    total_budget = max(1, _MAX_DU_TOTAL_ENTRIES)
+    entry_budget = max(
+        1,
+        min(
+            max_entries_per_volume,
+            _MAX_DU_ENTRIES,
+            max(1, total_budget // len(paths)),
+        ),
+    )
+    timeout_seconds = max(0.001, _DU_TIMEOUT_SECONDS)
+    time_slice_seconds = max(0.001, timeout_seconds / len(paths))
+    scans: dict[str, dict[str, Any]] = {}
+    total_entries_scanned = 0
+    for path in paths:
+        try:
+            root_device = path.lstat().st_dev
+        except OSError:
+            root_device = None
+        budget = _ScanBudget(
+            max_entries=entry_budget,
+            deadline=time.monotonic() + time_slice_seconds,
+        )
+        scan = _du_path(path, entry_budget, root_device, budget)
+        scans[str(path)] = scan
+        total_entries_scanned += budget.entries_scanned
+    return scans, {
+        "max_entries_per_volume": entry_budget,
+        "max_total_entries": total_budget,
+        "total_entries_scanned": total_entries_scanned,
+        "timeout_seconds": timeout_seconds,
+        "time_slice_seconds": time_slice_seconds,
+        "timed_out": any(scan["timed_out"] for scan in scans.values()),
+        "truncated": any(scan["truncated"] for scan in scans.values()),
+        "scan_errors": sum(scan["scan_errors"] for scan in scans.values()),
+    }
+
+
+def _k3s_volume_usage(limit: int, max_entries_per_volume: int) -> dict[str, Any]:
+    volumes, errors = _k3s_volume_inventory()
+    roots = _resolved_k3s_volume_roots()
+    paths_by_key: dict[str, Path] = {}
+    attributed_paths: set[Path] = set()
+    for volume in volumes:
+        candidate = volume.pop("_candidate_local_path")
+        safe_path = _safe_k3s_volume_path(candidate, roots)
+        if safe_path is None:
+            volume["usage"] = None
+            volume["scan_status"] = "outside_configured_roots" if candidate else "no_local_path"
+            continue
+        volume["_local_path_key"] = str(safe_path)
+        volume["local_path"] = _public_host_path(safe_path)
+        paths_by_key.setdefault(str(safe_path), safe_path)
+        attributed_paths.add(safe_path)
+
+    root_children, discovery_errors, discovery_truncated = _k3s_volume_root_children(roots)
+    errors.extend(f"volume discovery: {error}" for error in discovery_errors)
+    unattributed_paths = [
+        child
+        for child in root_children
+        if child not in attributed_paths
+        and not any(child in attributed.parents for attributed in attributed_paths)
+    ]
+    for path in unattributed_paths:
+        paths_by_key.setdefault(str(path), path)
+
+    path_cap = max(1, _MAX_K3S_VOLUME_PATHS)
+    scan_paths = list(paths_by_key.values())[:path_cap]
+    path_limit_truncated = len(paths_by_key) > path_cap
+    scans, scan_summary = _scan_k3s_volume_paths(scan_paths, max_entries_per_volume)
+
+    counted_paths: set[str] = set()
+    namespace_rollups: dict[str, dict[str, Any]] = {}
+    for volume in volumes:
+        path_key = volume.pop("_local_path_key", None)
+        scan = scans.get(path_key) if path_key else None
+        if path_key and scan is None:
+            volume["usage"] = None
+            volume["scan_status"] = "path_limit"
+        elif scan is not None:
+            volume["usage"] = scan
+            volume["scan_status"] = "missing" if not scan["exists"] else "scanned"
+        namespace = volume.get("namespace")
+        if not namespace:
+            continue
+        rollup = namespace_rollups.setdefault(
+            str(namespace),
+            {
+                "namespace": str(namespace),
+                "used_bytes": 0,
+                "volume_count": 0,
+                "truncated_volume_count": 0,
+                "_pods": set(),
+            },
+        )
+        rollup["volume_count"] += 1
+        rollup["_pods"].update(
+            str(mount["pod"]) for mount in volume["pod_mounts"] if mount.get("pod")
+        )
+        if scan is None or path_key in counted_paths:
+            continue
+        counted_paths.add(path_key)
+        rollup["used_bytes"] += scan["size_bytes"]
+        if scan["truncated"]:
+            rollup["truncated_volume_count"] += 1
+
+    namespaces = []
+    for rollup in namespace_rollups.values():
+        pods = rollup.pop("_pods")
+        rollup["pod_count"] = len(pods)
+        namespaces.append(rollup)
+    namespaces.sort(key=lambda item: item["used_bytes"], reverse=True)
+
+    volumes.sort(
+        key=lambda volume: (
+            volume["usage"]["size_bytes"] if volume.get("usage") else -1,
+            str(volume.get("namespace") or ""),
+            str(volume.get("persistent_volume_claim") or ""),
+        ),
+        reverse=True,
+    )
+    unattributed = [scans[str(path)] for path in unattributed_paths if str(path) in scans]
+    unattributed.sort(key=lambda item: item["size_bytes"], reverse=True)
+    cap = max(1, min(limit, 100))
+    return {
+        "volumes": volumes[:cap],
+        "namespaces": namespaces,
+        "unattributed_paths": unattributed[:cap],
+        "configured_volume_roots": list(_K3S_VOLUME_ROOTS),
+        "volume_count": len(volumes),
+        "unattributed_path_count": len(unattributed_paths),
+        "path_limit": path_cap,
+        "paths_scanned": len(scan_paths),
+        "discovery_truncated": discovery_truncated or path_limit_truncated,
+        **scan_summary,
+        "errors": errors,
+        "same_filesystem_only": True,
+    }
+
+
 def get_cpu_info() -> dict[str, Any]:
     """CPU utilization, core counts, and per-core percentages for this node."""
     return {
@@ -995,6 +1399,7 @@ for _tool in (
     get_k3s_pods,
     get_k3s_container_memory,
     get_k3s_process_attribution,
+    get_k3s_volume_usage,
     stat_path,
     read_text_head,
 ):

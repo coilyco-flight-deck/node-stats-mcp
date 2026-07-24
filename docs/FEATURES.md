@@ -14,6 +14,7 @@ Living inventory of what ships from this repo. One image, one process: a FastMCP
 - **get_k3s_pods** - read-only namespace/pod/container inventory from the k3s API.
 - **get_k3s_container_memory** - approximate per-container memory from metrics-server or host cgroups.
 - **get_k3s_process_attribution** - top host processes annotated with namespace/pod/container when cgroup metadata resolves.
+- **get_k3s_volume_usage** - worker-thread local-volume scan joined to namespaces, PVCs, PVs, and pod/container mount paths. Namespace totals count each volume once, server-owned roots constrain every scan, fair per-volume budgets prevent starvation, and unowned root children remain visible as unattributed storage.
 - **get_system_snapshot** - one-shot overview: cpu, memory, load, boot time, uptime, logged-in users.
 - **stat_path** - size/mode/mtime/type for a path under the readable-root allowlist.
 - **read_text_head** - up to `max_bytes` (capped) of a text file under the allowlist.
@@ -23,6 +24,7 @@ Living inventory of what ships from this repo. One image, one process: a FastMCP
 - **Read-only** - no tool mutates the host.
 - **Prefix-allowlisted file access** - `NODE_STATS_READABLE_ROOTS` (colon-separated, empty by default) gates `stat_path` / `read_text_head`. Paths resolve real (symlinks collapsed) and must sit under an allowed root. `NODE_STATS_MAX_READ_BYTES` caps read size.
 - **Fixed pressure scan paths** - `get_pressure_path_usage` only scans `NODE_STATS_PRESSURE_PATHS`, never a caller-supplied raw path. Nested configured paths are skipped when an ancestor is already scanned, and traversal is capped per path, globally, and by wall clock.
+- **Fixed Kubernetes volume roots** - `get_k3s_volume_usage` accepts no path argument. The server resolves PV paths beneath `NODE_STATS_K3S_VOLUME_ROOTS`, rejects paths outside those roots, and bounds both one-level orphan discovery and recursive usage scans.
 - **Network-gated reach** - the endpoint is meant to sit behind the tailnet / node boundary, not public.
 
 ## Configuration (env)
@@ -33,6 +35,8 @@ Living inventory of what ships from this repo. One image, one process: a FastMCP
 - `NODE_STATS_MAX_READ_BYTES` (default 65536).
 - `NODE_STATS_KUBECONFIG` (default `/etc/rancher/k3s/k3s.yaml`, interpreted inside `ROOTFS`) - host kubeconfig used for the k3s inventory when present.
 - `NODE_STATS_K8S_TIMEOUT_SECONDS` (default 3) - timeout for Kubernetes API reads.
+- `NODE_STATS_K3S_VOLUME_ROOTS` (default `/var/lib/rancher/k3s/storage`) - colon-separated fixed roots that may contain local PV paths.
+- `NODE_STATS_MAX_K3S_VOLUME_PATHS` (default 1000) - cap on local PV and unattributed child paths considered by one volume-usage request.
 - `NODE_STATS_DISK_WARN_PERCENT` (default 80).
 - `NODE_STATS_DISK_CRITICAL_PERCENT` (default 85).
 - `NODE_STATS_PRESSURE_PATHS` - colon-separated fixed paths for pressure scans, interpreted inside `ROOTFS`.

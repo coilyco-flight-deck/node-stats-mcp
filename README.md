@@ -1,6 +1,6 @@
 # node-stats-mcp
 
-A node-local MCP battery. It reads the node it runs on - CPU, memory, disk, disk-pressure runway, load, network, top processes, and bounded file metadata - and serves that over MCP (streamable-HTTP), so an agent can inspect a node without a host bind mount.
+A node-local MCP battery. It reads the node it runs on - CPU, memory, disk, disk-pressure runway, load, network, top processes, Kubernetes storage attribution, and bounded file metadata - and serves that over MCP (streamable-HTTP).
 
 This is the generic node-introspection spine, first instance of the upstream pattern: a per-node MCP agent, the same shape as node-exporter (DaemonSet-or-node-pinned + hostPath + host namespaces), but exposing a tool surface instead of Prometheus metrics.
 
@@ -15,16 +15,19 @@ The server also exposes a read-only k3s inventory surface for host-to-pod attrib
 - `get_k3s_pods` - namespace, pod, phase, node, restart count, container names/images, pod IP, age.
 - `get_k3s_container_memory` - per-container memory from metrics-server when available, else approximate RSS summed from host cgroups.
 - `get_k3s_process_attribution` - top host processes annotated with the owning pod/container when cgroup data and pod metadata line up.
+- `get_k3s_volume_usage` - bounded local-volume disk usage joined to namespaces, PVCs, PVs, and pod/container mount paths, plus unattributed storage directories.
 
-The API read path prefers the host-mounted k3s admin kubeconfig at `/host/etc/rancher/k3s/k3s.yaml` and falls back to the pod's service account when needed. All three tools stay read-only.
+The API read path prefers the host-mounted k3s admin kubeconfig at `/host/etc/rancher/k3s/k3s.yaml` and falls back to the pod's service account when needed. All four tools stay read-only.
 
 ## Safety
 
-Read-only by construction: every tool is a read, none mutate the host. File introspection (`stat_path`, `read_text_head`) is **prefix-allowlisted** via `NODE_STATS_READABLE_ROOTS` (empty by default = file reads denied) and size-capped, so a tool can never be walked into `/host/root/.ssh`. Disk pressure scans (`get_pressure_path_usage`) use a fixed configured path list, so callers cannot turn the MCP into a root filesystem browser. Reach is gated at the network layer (the tailnet / node), not by the tool.
+Read-only by construction: every tool is a read, none mutate the host. File introspection (`stat_path`, `read_text_head`) is **prefix-allowlisted** via `NODE_STATS_READABLE_ROOTS` (empty by default = file reads denied) and size-capped, so a tool can never be walked into `/host/root/.ssh`. Disk pressure scans (`get_pressure_path_usage`) use a fixed configured path list. Kubernetes volume scans resolve API-reported PV paths beneath `NODE_STATS_K3S_VOLUME_ROOTS` and reject every path outside those roots. Callers cannot turn either tool into a root filesystem browser. Reach is gated at the network layer (the tailnet / node), not by the tool.
 
 ## Disk pressure
 
 `get_filesystem_pressure` reports root filesystem capacity, available bytes, inode use, and byte runway to configurable warning and critical thresholds. `get_pressure_path_usage` scans a fixed, bounded set of node-pressure paths such as logs, journald, kubelet, k3s, and containerd storage. Traversal runs in a worker thread, so fast tools remain responsive. Per-path and shared total-entry caps plus a wall-clock limit return explicit scan-error, truncation, and timeout metadata. Nested configured paths are coalesced, with skipped overlaps reported instead of walking the same subtree twice.
+
+`get_k3s_volume_usage` narrows that disk view to local persistent volumes. It joins Kubernetes pod, PVC, and PV metadata to server-approved host paths, reports pod/container mount points, rolls unique volume bytes up by namespace, and separately reports storage-root children that no current PV owns. Fair entry and time slices keep one large volume from starving its siblings.
 
 ## Run it locally
 
