@@ -89,6 +89,9 @@ _PRESSURE_PATHS = tuple(
 )
 _MAX_DU_ENTRIES = int(os.environ.get("NODE_STATS_MAX_DU_ENTRIES", "200000"))
 _MAX_DU_TOTAL_ENTRIES = int(os.environ.get("NODE_STATS_MAX_DU_TOTAL_ENTRIES", "200000"))
+_MAX_PRESSURE_CHILDREN_PER_ROOT = int(
+    os.environ.get("NODE_STATS_MAX_PRESSURE_CHILDREN_PER_ROOT", "1000")
+)
 _DU_TIMEOUT_SECONDS = float(os.environ.get("NODE_STATS_DU_TIMEOUT_SECONDS", "10"))
 
 mcp = FastMCP(
@@ -948,35 +951,209 @@ def _coalesced_pressure_paths() -> tuple[list[Path], list[dict[str, str]]]:
     return selected, skipped
 
 
-def _pressure_path_usage(limit: int, max_entries_per_path: int) -> dict[str, Any]:
-    """Run the fixed-path traversal in a worker thread with shared limits."""
-    root = _host_path("/")
+def _pressure_root_result(path: Path, exists: bool) -> dict[str, Any]:
+    return {
+        **_scan_result(path, exists),
+        "children": [],
+        "children_discovered": 0,
+        "children_returned": 0,
+        "child_results_truncated": False,
+        "discovery_truncated": False,
+        "discovery_truncation_reason": None,
+        "discovery_timed_out": False,
+    }
+
+
+def _pressure_root_children(
+    root: Path, max_children: int, deadline: float
+) -> tuple[dict[str, Any], list[tuple[Path, int | None]]]:
+    """Discover one level beneath one fixed root without following symlinks."""
     try:
-        root_device = root.stat().st_dev
+        root_stat = root.lstat()
     except FileNotFoundError:
-        root_device = None
-    entry_budget = max(1, min(max_entries_per_path, _MAX_DU_ENTRIES))
+        return _pressure_root_result(root, exists=False), []
+    except PermissionError:
+        result = _pressure_root_result(root, exists=False)
+        result["permission_errors"] += 1
+        return result, []
+    except OSError as exc:
+        result = _pressure_root_result(root, exists=False)
+        _record_scan_error(result, exc)
+        return result, []
+
+    result = _pressure_root_result(root, exists=True)
+    root_device = root_stat.st_dev
+    if not stat.S_ISDIR(root_stat.st_mode):
+        result["children_discovered"] = 1
+        return result, [(root, root_device)]
+
+    children: list[tuple[Path, int | None]] = []
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if time.monotonic() >= deadline:
+                    result["discovery_truncated"] = True
+                    result["discovery_truncation_reason"] = "timeout"
+                    result["discovery_timed_out"] = True
+                    break
+                if len(children) >= max_children:
+                    result["discovery_truncated"] = True
+                    result["discovery_truncation_reason"] = "child_cap"
+                    break
+                children.append((Path(entry.path), root_device))
+    except PermissionError:
+        result["permission_errors"] += 1
+    except FileNotFoundError:
+        result["exists"] = False
+    except OSError as exc:
+        _record_scan_error(result, exc)
+    children.sort(key=lambda item: str(item[0]))
+    result["children_discovered"] = len(children)
+    return result, children
+
+
+def _scan_pressure_children(
+    children: list[tuple[Path, int | None]],
+    max_entries_per_child: int,
+    deadline: float,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Give every discovered child an independent fair share of remaining work."""
+    total_budget = max(1, _MAX_DU_TOTAL_ENTRIES)
+    if not children:
+        return {}, {
+            "max_entries_per_child": 0,
+            "total_entries_scanned": 0,
+            "time_slice_seconds": 0.0,
+            "timed_out": False,
+            "truncated": False,
+            "scan_errors": 0,
+            "permission_errors": 0,
+            "skipped_different_filesystem": 0,
+        }
+
+    selected_children = children[:total_budget]
+    unscanned_children = children[total_budget:]
+    entry_budget = max(
+        1,
+        min(
+            max_entries_per_child,
+            _MAX_DU_ENTRIES,
+            max(1, total_budget // len(selected_children)),
+        ),
+    )
+    remaining_seconds = max(0.001, deadline - time.monotonic())
+    time_slice_seconds = max(0.001, remaining_seconds / len(selected_children))
+    scans: dict[str, dict[str, Any]] = {}
+    total_entries_scanned = 0
+    for path, root_device in selected_children:
+        budget = _ScanBudget(
+            max_entries=entry_budget,
+            deadline=time.monotonic() + time_slice_seconds,
+        )
+        scan = _du_path(path, entry_budget, root_device, budget)
+        scans[str(path)] = scan
+        total_entries_scanned += budget.entries_scanned
+    for path, _ in unscanned_children:
+        scan = _scan_result(path, exists=True)
+        scan["truncated"] = True
+        scan["truncation_reason"] = "global_entry_budget"
+        scans[str(path)] = scan
+    return scans, {
+        "max_entries_per_child": entry_budget,
+        "total_entries_scanned": total_entries_scanned,
+        "time_slice_seconds": time_slice_seconds,
+        "timed_out": any(scan["timed_out"] for scan in scans.values()),
+        "truncated": any(scan["truncated"] for scan in scans.values()),
+        "scan_errors": sum(scan["scan_errors"] for scan in scans.values()),
+        "permission_errors": sum(scan["permission_errors"] for scan in scans.values()),
+        "skipped_different_filesystem": sum(
+            scan["skipped_different_filesystem"] for scan in scans.values()
+        ),
+    }
+
+
+def _pressure_path_usage(limit: int, max_entries_per_path: int) -> dict[str, Any]:
+    """Attribute fixed pressure roots to their immediate children with fair limits."""
+    child_limit = max(1, min(limit, 100))
+    max_children_per_root = max(1, _MAX_PRESSURE_CHILDREN_PER_ROOT)
     total_budget = max(1, _MAX_DU_TOTAL_ENTRIES)
     timeout_seconds = max(0.001, _DU_TIMEOUT_SECONDS)
-    budget = _ScanBudget(
-        max_entries=total_budget,
-        deadline=time.monotonic() + timeout_seconds,
-    )
+    request_deadline = time.monotonic() + timeout_seconds
     scan_paths, skipped_nested_paths = _coalesced_pressure_paths()
-    paths = [_du_path(path, entry_budget, root_device, budget) for path in scan_paths]
-    paths.sort(key=lambda item: item["size_bytes"], reverse=True)
-    timed_out = any(path["timed_out"] for path in paths)
+    discovery_time_slice_seconds = (
+        max(0.001, timeout_seconds / (2 * len(scan_paths))) if scan_paths else 0.0
+    )
+    roots: list[tuple[dict[str, Any], list[tuple[Path, int | None]]]] = []
+    for path in scan_paths:
+        root, root_children = _pressure_root_children(
+            path,
+            max_children_per_root,
+            time.monotonic() + discovery_time_slice_seconds,
+        )
+        roots.append((root, root_children))
+
+    children = [
+        root_children[index]
+        for index in range(max((len(root_children) for _, root_children in roots), default=0))
+        for _, root_children in roots
+        if index < len(root_children)
+    ]
+
+    scans, scan_summary = _scan_pressure_children(
+        children,
+        max_entries_per_path,
+        request_deadline,
+    )
+    paths: list[dict[str, Any]] = []
+    for root, root_children in roots:
+        child_scans = [scans[str(path)] for path, _ in root_children if str(path) in scans]
+        child_scans.sort(key=lambda item: (-item["size_bytes"], item["path"]))
+        root["children"] = child_scans[:child_limit]
+        root["children_returned"] = len(root["children"])
+        root["child_results_truncated"] = len(child_scans) > child_limit
+        root["size_bytes"] = sum(child["size_bytes"] for child in child_scans)
+        root["entries_scanned"] = sum(child["entries_scanned"] for child in child_scans)
+        root["permission_errors"] += sum(child["permission_errors"] for child in child_scans)
+        root["scan_errors"] += sum(child["scan_errors"] for child in child_scans)
+        root["skipped_different_filesystem"] = sum(
+            child["skipped_different_filesystem"] for child in child_scans
+        )
+        child_truncated = any(child["truncated"] for child in child_scans)
+        root["truncated"] = root["discovery_truncated"] or child_truncated
+        root["truncation_reason"] = root["discovery_truncation_reason"]
+        if root["truncation_reason"] is None and child_truncated:
+            root["truncation_reason"] = "child_scan_truncated"
+        root["timed_out"] = root["discovery_timed_out"] or any(
+            child["timed_out"] for child in child_scans
+        )
+        paths.append(root)
+
+    discovery_scan_errors = (
+        sum(root["scan_errors"] for root, _ in roots) - scan_summary["scan_errors"]
+    )
+    discovery_permission_errors = (
+        sum(root["permission_errors"] for root, _ in roots) - scan_summary["permission_errors"]
+    )
+    discovery_truncated = any(root["discovery_truncated"] for root, _ in roots)
+    timed_out = any(root["timed_out"] for root, _ in roots)
     return {
-        "paths": paths[: max(1, min(limit, 100))],
+        "paths": paths,
         "configured_paths": list(_PRESSURE_PATHS),
         "skipped_nested_paths": skipped_nested_paths,
-        "max_entries_per_path": entry_budget,
+        "limit_per_root": child_limit,
+        "max_children_per_root": max_children_per_root,
+        "max_entries_per_path": scan_summary["max_entries_per_child"],
+        "max_entries_per_child": scan_summary["max_entries_per_child"],
         "max_total_entries": total_budget,
-        "total_entries_scanned": budget.entries_scanned,
+        "total_entries_scanned": scan_summary["total_entries_scanned"],
         "timeout_seconds": timeout_seconds,
+        "discovery_time_slice_seconds": discovery_time_slice_seconds,
+        "time_slice_seconds": scan_summary["time_slice_seconds"],
         "timed_out": timed_out,
-        "truncated": any(path["truncated"] for path in paths),
-        "scan_errors": sum(path["scan_errors"] for path in paths),
+        "truncated": discovery_truncated or scan_summary["truncated"],
+        "scan_errors": discovery_scan_errors + scan_summary["scan_errors"],
+        "permission_errors": discovery_permission_errors + scan_summary["permission_errors"],
+        "skipped_different_filesystem": scan_summary["skipped_different_filesystem"],
         "same_filesystem_only": True,
     }
 
@@ -1305,13 +1482,15 @@ def get_filesystem_pressure() -> dict[str, Any]:
 async def get_pressure_path_usage(
     limit: int = 20, max_entries_per_path: int = _MAX_DU_ENTRIES
 ) -> dict[str, Any]:
-    """Bounded usage scan for fixed host paths that commonly drive node pressure.
+    """Bounded child usage beneath fixed host paths that commonly drive pressure.
 
     Traversal runs in a worker thread, leaving the MCP event loop available for
-    fast tools such as get_filesystem_pressure. Per-path, total-entry, and
-    wall-clock limits return truncation, timeout, and error metadata. Nested
-    configured paths are coalesced so the same tree is not walked twice. The
-    caller can tune only the per-path cap and result count, never a raw path.
+    fast tools such as get_filesystem_pressure. Every configured root gets a
+    bounded discovery slice, then every immediate child gets a fair entry and
+    time slice. Per-child results carry truncation, timeout, filesystem-skip,
+    permission, and scan-error metadata. Nested configured roots are coalesced.
+    The caller can tune only the child entry cap and per-root result count,
+    never a raw path.
     """
     return await asyncio.to_thread(_pressure_path_usage, limit, max_entries_per_path)
 

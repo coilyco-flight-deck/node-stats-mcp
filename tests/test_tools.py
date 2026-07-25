@@ -26,6 +26,7 @@ def _load(
     pressure_paths: str | None = None,
     max_du_entries: str | None = None,
     max_du_total_entries: str | None = None,
+    max_pressure_children_per_root: str | None = None,
     du_timeout_seconds: str | None = None,
     k3s_volume_roots: str | None = None,
     max_k3s_volume_paths: str | None = None,
@@ -47,6 +48,13 @@ def _load(
         monkeypatch.delenv("NODE_STATS_MAX_DU_TOTAL_ENTRIES", raising=False)
     else:
         monkeypatch.setenv("NODE_STATS_MAX_DU_TOTAL_ENTRIES", max_du_total_entries)
+    if max_pressure_children_per_root is None:
+        monkeypatch.delenv("NODE_STATS_MAX_PRESSURE_CHILDREN_PER_ROOT", raising=False)
+    else:
+        monkeypatch.setenv(
+            "NODE_STATS_MAX_PRESSURE_CHILDREN_PER_ROOT",
+            max_pressure_children_per_root,
+        )
     if du_timeout_seconds is None:
         monkeypatch.delenv("NODE_STATS_DU_TIMEOUT_SECONDS", raising=False)
     else:
@@ -140,15 +148,29 @@ def test_pressure_path_usage_uses_fixed_env_paths(
     assert by_path["/missing"]["exists"] is False
     assert by_path["/hot"]["exists"] is True
     assert by_path["/hot"]["size_bytes"] > by_path["/cold"]["size_bytes"]
-    assert by_path["/hot"]["permission_errors"] == 0
-    assert by_path["/hot"]["scan_errors"] == 0
-    assert by_path["/hot"]["skipped_different_filesystem"] == 0
+    hot_child = by_path["/hot"]["children"][0]
+    assert hot_child["path"] == "/hot/blob.bin"
+    assert hot_child["permission_errors"] == 0
+    assert hot_child["scan_errors"] == 0
+    assert hot_child["skipped_different_filesystem"] == 0
+    assert {
+        "size_bytes",
+        "entries_scanned",
+        "permission_errors",
+        "scan_errors",
+        "skipped_different_filesystem",
+        "timed_out",
+        "truncated",
+    } <= hot_child.keys()
 
 
-def test_pressure_path_usage_caps_entries(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    (tmp_path / "hot").mkdir()
+def test_pressure_path_usage_truncates_large_child(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    large = tmp_path / "hot" / "large"
+    large.mkdir(parents=True)
     for idx in range(10):
-        (tmp_path / "hot" / f"{idx}.txt").write_text("x")
+        (large / f"{idx}.txt").write_text("x")
     server = _load(
         monkeypatch,
         str(tmp_path),
@@ -158,21 +180,22 @@ def test_pressure_path_usage_caps_entries(monkeypatch: pytest.MonkeyPatch, tmp_p
     )
 
     got = asyncio.run(server.get_pressure_path_usage(limit=1, max_entries_per_path=1000))
-    path = got["paths"][0]
+    child = got["paths"][0]["children"][0]
 
     assert got["max_entries_per_path"] == 3
-    assert path["path"] == "/hot"
-    assert path["entries_scanned"] == 3
-    assert path["truncated"] is True
-    assert path["truncation_reason"] == "per_path_entry_cap"
+    assert got["max_entries_per_child"] == 3
+    assert child["path"] == "/hot/large"
+    assert child["entries_scanned"] == 3
+    assert child["truncated"] is True
+    assert child["truncation_reason"] == "per_path_entry_cap"
 
 
-def test_pressure_path_usage_caps_total_entries(
+def test_pressure_path_usage_shares_budget_across_roots_and_children(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     for name in ("hot", "cold"):
-        directory = tmp_path / name
-        directory.mkdir()
+        directory = tmp_path / name / "large"
+        directory.mkdir(parents=True)
         for idx in range(5):
             (directory / f"{idx}.txt").write_text("x")
     server = _load(
@@ -188,15 +211,71 @@ def test_pressure_path_usage_caps_total_entries(
 
     assert got["max_total_entries"] == 4
     assert got["total_entries_scanned"] == 4
+    assert got["max_entries_per_child"] == 2
     assert got["truncated"] is True
-    assert any(path["truncation_reason"] == "global_entry_budget" for path in got["paths"])
+    children = [path["children"][0] for path in got["paths"]]
+    assert {child["path"] for child in children} == {"/hot/large", "/cold/large"}
+    assert all(child["entries_scanned"] == 2 for child in children)
+    assert all(child["truncated"] is True for child in children)
+
+
+def test_pressure_path_usage_bounds_discovery_per_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    for name in ("hot", "cold"):
+        root = tmp_path / name
+        root.mkdir()
+        for child in ("a", "b", "c"):
+            (root / child).mkdir()
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        pressure_paths="/hot:/cold",
+        max_pressure_children_per_root="1",
+    )
+
+    got = asyncio.run(server.get_pressure_path_usage(limit=10, max_entries_per_path=100))
+
+    assert got["max_children_per_root"] == 1
+    assert [path["path"] for path in got["paths"]] == ["/hot", "/cold"]
+    assert all(path["children_discovered"] == 1 for path in got["paths"])
+    assert all(path["discovery_truncated"] is True for path in got["paths"])
+    assert all(path["discovery_truncation_reason"] == "child_cap" for path in got["paths"])
+
+
+def test_pressure_path_usage_reports_unscanned_children_fairly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    for name in ("hot", "cold"):
+        root = tmp_path / name
+        root.mkdir()
+        for child in ("a", "b"):
+            (root / child).mkdir()
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        pressure_paths="/hot:/cold",
+        max_du_total_entries="2",
+    )
+
+    got = asyncio.run(server.get_pressure_path_usage(limit=10, max_entries_per_path=100))
+
+    assert got["total_entries_scanned"] == 2
+    for root in got["paths"]:
+        assert sum(child["entries_scanned"] for child in root["children"]) == 1
+        assert (
+            sum(child["truncation_reason"] == "global_entry_budget" for child in root["children"])
+            == 1
+        )
 
 
 def test_pressure_path_usage_reports_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    directory = tmp_path / "hot"
-    directory.mkdir()
+    directory = tmp_path / "hot" / "large"
+    directory.mkdir(parents=True)
     (directory / "slow.txt").write_text("x")
     server = _load(
         monkeypatch,
@@ -208,7 +287,8 @@ def test_pressure_path_usage_reports_timeout(
     original_scandir = server.os.scandir
 
     def slow_scandir(path):
-        time.sleep(0.02)
+        if Path(path).name == "large":
+            time.sleep(0.02)
         return original_scandir(path)
 
     monkeypatch.setattr(server.os, "scandir", slow_scandir)
@@ -217,8 +297,9 @@ def test_pressure_path_usage_reports_timeout(
 
     assert got["timed_out"] is True
     assert got["truncated"] is True
-    assert got["paths"][0]["timed_out"] is True
-    assert got["paths"][0]["truncation_reason"] == "timeout"
+    child = got["paths"][0]["children"][0]
+    assert child["timed_out"] is True
+    assert child["truncation_reason"] == "timeout"
 
 
 def test_pressure_path_usage_coalesces_nested_paths(
@@ -237,7 +318,22 @@ def test_pressure_path_usage_coalesces_nested_paths(
     got = asyncio.run(server.get_pressure_path_usage(limit=10, max_entries_per_path=100))
 
     assert [path["path"] for path in got["paths"]] == ["/hot"]
+    assert [child["path"] for child in got["paths"][0]["children"]] == ["/hot/nested"]
     assert got["skipped_nested_paths"] == [{"path": "/hot/nested", "covered_by": "/hot"}]
+
+
+def test_pressure_path_usage_has_no_arbitrary_path_argument(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "hot" / "inside").mkdir(parents=True)
+    (tmp_path / "outside" / "secret").mkdir(parents=True)
+    server = _load(monkeypatch, str(tmp_path), "", pressure_paths="/hot")
+
+    got = asyncio.run(server.get_pressure_path_usage())
+    reported = {child["path"] for root in got["paths"] for child in root["children"]}
+
+    assert "path" not in inspect.signature(server.get_pressure_path_usage).parameters
+    assert reported == {"/hot/inside"}
 
 
 def test_filesystem_pressure_stays_responsive_during_path_scan(
