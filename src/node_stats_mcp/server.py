@@ -34,7 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 import psutil
@@ -54,6 +54,7 @@ _READABLE_ROOTS = [r for r in os.environ.get("NODE_STATS_READABLE_ROOTS", "").sp
 _MAX_READ_BYTES = int(os.environ.get("NODE_STATS_MAX_READ_BYTES", "65536"))
 _K8S_TIMEOUT_SECONDS = float(os.environ.get("NODE_STATS_K8S_TIMEOUT_SECONDS", "3"))
 _KUBECONFIG_PATH = os.environ.get("NODE_STATS_KUBECONFIG", "/etc/rancher/k3s/k3s.yaml")
+_K3S_NODE_NAME = os.environ.get("NODE_STATS_K3S_NODE_NAME")
 _DEFAULT_K3S_VOLUME_ROOTS = ("/var/lib/rancher/k3s/storage",)
 _K3S_VOLUME_ROOTS = tuple(
     path
@@ -93,6 +94,18 @@ _MAX_PRESSURE_CHILDREN_PER_ROOT = int(
     os.environ.get("NODE_STATS_MAX_PRESSURE_CHILDREN_PER_ROOT", "1000")
 )
 _DU_TIMEOUT_SECONDS = float(os.environ.get("NODE_STATS_DU_TIMEOUT_SECONDS", "10"))
+
+_VMSTAT_KEYS = (
+    "oom_kill",
+    "pgmajfault",
+    "pgscan_direct",
+    "pgscan_direct_throttle",
+    "pgscan_kswapd",
+    "pgsteal_direct",
+    "pgsteal_kswapd",
+    "pswpin",
+    "pswpout",
+)
 
 mcp = FastMCP(
     "node-stats",
@@ -349,6 +362,254 @@ def _parse_quantity(value: str | None) -> int | None:
     if suffix in decimal:
         return int(number * decimal[suffix])
     return int(number)
+
+
+def _parse_psi(text: str) -> dict[str, dict[str, float | int]]:
+    pressure: dict[str, dict[str, float | int]] = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        values: dict[str, float | int] = {}
+        for field in fields[1:]:
+            key, separator, raw_value = field.partition("=")
+            if not separator:
+                continue
+            try:
+                values[key] = int(raw_value) if key == "total" else float(raw_value)
+            except ValueError:
+                continue
+        pressure[fields[0]] = values
+    return pressure
+
+
+def _node_contention(limit: int) -> dict[str, Any]:
+    errors: list[str] = []
+    psi: dict[str, Any] = {}
+    for resource in ("cpu", "memory", "io"):
+        path = f"/proc/pressure/{resource}"
+        text = _read_host_text(path)
+        if text is None:
+            errors.append(f"{path}: unavailable")
+            continue
+        psi[resource] = _parse_psi(text)
+
+    vmstat: dict[str, int] = {}
+    vmstat_text = _read_host_text("/proc/vmstat")
+    if vmstat_text is None:
+        errors.append("/proc/vmstat: unavailable")
+    else:
+        for line in vmstat_text.splitlines():
+            key, separator, raw_value = line.partition(" ")
+            if key not in _VMSTAT_KEYS or not separator:
+                continue
+            try:
+                vmstat[key] = int(raw_value.strip())
+            except ValueError:
+                continue
+
+    devices: list[dict[str, Any]] = []
+    try:
+        counters = psutil.disk_io_counters(perdisk=True) or {}
+    except (OSError, RuntimeError) as exc:
+        counters = {}
+        errors.append(f"block devices: {exc}")
+    for device, counter in counters.items():
+        values = counter._asdict()
+        devices.append(
+            {
+                "device": device,
+                **{
+                    key: int(value)
+                    for key, value in values.items()
+                    if isinstance(value, int | float)
+                },
+            }
+        )
+    devices.sort(
+        key=lambda entry: (
+            entry.get("busy_time", 0),
+            entry.get("read_bytes", 0) + entry.get("write_bytes", 0),
+        ),
+        reverse=True,
+    )
+    cap = max(1, min(limit, 100))
+    return {
+        "pressure_stall_information": psi,
+        "vm_pressure_counters": vmstat,
+        "block_devices": devices[:cap],
+        "block_device_count": len(devices),
+        "errors": errors,
+    }
+
+
+def _k3s_node() -> tuple[dict[str, Any] | None, list[str]]:
+    items, errors = _k8s_list("/api/v1/nodes")
+    if _K3S_NODE_NAME:
+        for item in items:
+            if item.get("metadata", {}).get("name") == _K3S_NODE_NAME:
+                return item, errors
+        errors.append(f"configured node {_K3S_NODE_NAME!r} was not returned by the API")
+        return None, errors
+    if len(items) == 1:
+        return items[0], errors
+    if not items:
+        errors.append("Kubernetes API returned no nodes")
+    else:
+        errors.append("multiple nodes returned, set NODE_STATS_K3S_NODE_NAME")
+    return None, errors
+
+
+def _usage_fields(value: Any, fields: tuple[str, ...]) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return {field: value.get(field) for field in fields if field in value}
+
+
+def _normalize_kubelet_network(value: Any) -> dict[str, Any] | None:
+    network = _usage_fields(value, ("time", "name", "rxBytes", "rxErrors", "txBytes", "txErrors"))
+    if network is None:
+        return None
+    if isinstance(value.get("interfaces"), list):
+        network["interfaces"] = [
+            fields
+            for interface in value["interfaces"][:100]
+            if (
+                fields := _usage_fields(
+                    interface,
+                    ("name", "rxBytes", "rxErrors", "txBytes", "txErrors"),
+                )
+            )
+        ]
+    return network
+
+
+_CPU_USAGE_FIELDS = ("time", "usageNanoCores", "usageCoreNanoSeconds")
+_MEMORY_USAGE_FIELDS = (
+    "time",
+    "availableBytes",
+    "usageBytes",
+    "workingSetBytes",
+    "rssBytes",
+    "pageFaults",
+    "majorPageFaults",
+)
+_FILESYSTEM_USAGE_FIELDS = (
+    "time",
+    "availableBytes",
+    "capacityBytes",
+    "usedBytes",
+    "inodesFree",
+    "inodes",
+    "inodesUsed",
+)
+
+
+def _normalize_kubelet_container(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": item.get("name"),
+        "start_time": item.get("startTime"),
+        "cpu": _usage_fields(item.get("cpu"), _CPU_USAGE_FIELDS),
+        "memory": _usage_fields(item.get("memory"), _MEMORY_USAGE_FIELDS),
+        "rootfs": _usage_fields(item.get("rootfs"), _FILESYSTEM_USAGE_FIELDS),
+        "logs": _usage_fields(item.get("logs"), _FILESYSTEM_USAGE_FIELDS),
+        "processes": _usage_fields(item.get("process_stats"), ("process_count",)),
+    }
+
+
+def _normalize_kubelet_pod(item: dict[str, Any]) -> dict[str, Any]:
+    pod_ref = item.get("podRef", {})
+    return {
+        "namespace": pod_ref.get("namespace"),
+        "pod": pod_ref.get("name"),
+        "uid": pod_ref.get("uid"),
+        "start_time": item.get("startTime"),
+        "cpu": _usage_fields(item.get("cpu"), _CPU_USAGE_FIELDS),
+        "memory": _usage_fields(item.get("memory"), _MEMORY_USAGE_FIELDS),
+        "network": _normalize_kubelet_network(item.get("network")),
+        "ephemeral_storage": _usage_fields(item.get("ephemeral-storage"), _FILESYSTEM_USAGE_FIELDS),
+        "volumes": [
+            {
+                "name": volume.get("name"),
+                "usage": _usage_fields(volume, _FILESYSTEM_USAGE_FIELDS),
+                "pvc_ref": volume.get("pvcRef"),
+            }
+            for volume in item.get("volume", [])[:100]
+            if isinstance(volume, dict)
+        ],
+        "containers": [
+            _normalize_kubelet_container(container)
+            for container in item.get("containers", [])[:100]
+            if isinstance(container, dict)
+        ],
+        "processes": _usage_fields(item.get("process_stats"), ("process_count",)),
+    }
+
+
+def _k3s_resource_usage(limit: int) -> dict[str, Any]:
+    node_item, errors = _k3s_node()
+    if node_item is None:
+        return {
+            "source": "unavailable",
+            "node": None,
+            "pods": [],
+            "pod_count": 0,
+            "returned_pod_count": 0,
+            "errors": errors,
+        }
+    node_name = node_item.get("metadata", {}).get("name")
+    try:
+        payload = _k8s_request(
+            f"/api/v1/nodes/{quote(str(node_name), safe='')}/proxy/stats/summary"
+        )
+    except (HTTPError, URLError, ValueError) as exc:
+        errors.append(f"kubelet summary: {exc}")
+        return {
+            "source": "unavailable",
+            "node": {"name": node_name},
+            "pods": [],
+            "pod_count": 0,
+            "returned_pod_count": 0,
+            "errors": errors,
+        }
+
+    node = payload.get("node", {})
+    runtime = node.get("runtime", {})
+    pods = [
+        _normalize_kubelet_pod(item) for item in payload.get("pods", []) if isinstance(item, dict)
+    ]
+    pods.sort(
+        key=lambda item: (item.get("memory") or {}).get("workingSetBytes") or 0,
+        reverse=True,
+    )
+    cap = max(1, min(limit, 100))
+    return {
+        "source": "kubelet-summary",
+        "node": {
+            "name": node.get("nodeName") or node_name,
+            "start_time": node.get("startTime"),
+            "cpu": _usage_fields(node.get("cpu"), _CPU_USAGE_FIELDS),
+            "memory": _usage_fields(node.get("memory"), _MEMORY_USAGE_FIELDS),
+            "network": _normalize_kubelet_network(node.get("network")),
+            "filesystem": _usage_fields(node.get("fs"), _FILESYSTEM_USAGE_FIELDS),
+            "runtime": {
+                "image_filesystem": _usage_fields(runtime.get("imageFs"), _FILESYSTEM_USAGE_FIELDS),
+                "container_filesystem": _usage_fields(
+                    runtime.get("containerFs"), _FILESYSTEM_USAGE_FIELDS
+                ),
+            },
+            "rlimit": _usage_fields(node.get("rlimit"), ("maxPID", "numOfRunningProcesses")),
+            "system_containers": [
+                _normalize_kubelet_container(container)
+                for container in node.get("systemContainers", [])[:20]
+                if isinstance(container, dict)
+            ],
+        },
+        "pods": pods[:cap],
+        "pod_count": len(pods),
+        "returned_pod_count": min(len(pods), cap),
+        "errors": errors,
+    }
 
 
 def _normalize_container_id(container_id: str | None) -> str | None:
@@ -743,6 +1004,16 @@ async def get_k3s_volume_usage(
     reads and traversal run in a worker thread so fast node tools stay responsive.
     """
     return await asyncio.to_thread(_k3s_volume_usage, limit, max_entries_per_volume)
+
+
+def get_node_pressure_stalls(limit: int = 20) -> dict[str, Any]:
+    """Linux PSI, selected VM-pressure counters, and bounded block-device I/O counters."""
+    return _node_contention(limit)
+
+
+async def get_k3s_resource_usage(limit: int = 20) -> dict[str, Any]:
+    """Bounded node and pod usage from this node's kubelet Summary API."""
+    return await asyncio.to_thread(_k3s_resource_usage, limit)
 
 
 def _allowed_roots() -> list[Path]:
@@ -1579,6 +1850,8 @@ for _tool in (
     get_k3s_container_memory,
     get_k3s_process_attribution,
     get_k3s_volume_usage,
+    get_node_pressure_stalls,
+    get_k3s_resource_usage,
     stat_path,
     read_text_head,
 ):

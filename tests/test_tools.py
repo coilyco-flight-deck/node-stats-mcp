@@ -373,6 +373,104 @@ def test_top_processes_validates_sort(monkeypatch: pytest.MonkeyPatch) -> None:
         server.get_top_processes(sort_by="bogus")
 
 
+def test_node_pressure_stalls_normalizes_fixed_host_sources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pressure_root = tmp_path / "proc" / "pressure"
+    pressure_root.mkdir(parents=True)
+    (pressure_root / "cpu").write_text("some avg10=1.25 avg60=0.50 avg300=0.10 total=1234\n")
+    (pressure_root / "memory").write_text(
+        "some avg10=0.20 avg60=0.10 avg300=0.05 total=500\n"
+        "full avg10=0.10 avg60=0.05 avg300=0.01 total=200\n"
+    )
+    (pressure_root / "io").write_text("some avg10=2.00 avg60=1.00 avg300=0.50 total=900\n")
+    (tmp_path / "proc" / "vmstat").write_text(
+        "pgmajfault 42\npswpin 3\npswpout 7\nnr_free_pages 999\n"
+    )
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    class Counter:
+        def _asdict(self):
+            return {
+                "read_count": 10,
+                "write_count": 20,
+                "read_bytes": 100,
+                "write_bytes": 200,
+                "busy_time": 30,
+            }
+
+    monkeypatch.setattr(
+        server.psutil,
+        "disk_io_counters",
+        lambda perdisk: {"nvme0n1": Counter()},
+    )
+
+    got = server.get_node_pressure_stalls()
+
+    assert got["errors"] == []
+    assert got["pressure_stall_information"]["cpu"]["some"]["avg10"] == 1.25
+    assert got["pressure_stall_information"]["memory"]["full"]["total"] == 200
+    assert got["vm_pressure_counters"] == {
+        "pgmajfault": 42,
+        "pswpin": 3,
+        "pswpout": 7,
+    }
+    assert got["block_devices"][0]["device"] == "nvme0n1"
+    assert "path" not in inspect.signature(server.get_node_pressure_stalls).parameters
+
+
+def test_k3s_resource_usage_normalizes_and_bounds_kubelet_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _load(monkeypatch, "/", "")
+    monkeypatch.setattr(
+        server,
+        "_k3s_node",
+        lambda: ({"metadata": {"name": "kai-server"}}, []),
+    )
+    requested_paths: list[str] = []
+
+    def fake_request(path: str, params=None):
+        requested_paths.append(path)
+        return {
+            "node": {
+                "nodeName": "kai-server",
+                "cpu": {"usageNanoCores": 1_000_000},
+                "memory": {"workingSetBytes": 4096},
+                "fs": {"capacityBytes": 10_000, "usedBytes": 6000},
+                "runtime": {"imageFs": {"usedBytes": 1000}},
+            },
+            "pods": [
+                {
+                    "podRef": {"namespace": "apps", "name": "small", "uid": "small-uid"},
+                    "memory": {"workingSetBytes": 100},
+                    "containers": [{"name": "worker", "memory": {"workingSetBytes": 80}}],
+                },
+                {
+                    "podRef": {"namespace": "ai", "name": "large", "uid": "large-uid"},
+                    "memory": {"workingSetBytes": 200},
+                    "ephemeral-storage": {"usedBytes": 75},
+                    "volume": [{"name": "data", "usedBytes": 50}],
+                    "containers": [{"name": "web", "memory": {"workingSetBytes": 150}}],
+                },
+            ],
+        }
+
+    monkeypatch.setattr(server, "_k8s_request", fake_request)
+
+    got = asyncio.run(server.get_k3s_resource_usage(limit=1))
+
+    assert requested_paths == ["/api/v1/nodes/kai-server/proxy/stats/summary"]
+    assert got["source"] == "kubelet-summary"
+    assert got["node"]["filesystem"]["usedBytes"] == 6000
+    assert got["pod_count"] == 2
+    assert got["returned_pod_count"] == 1
+    assert got["pods"][0]["pod"] == "large"
+    assert got["pods"][0]["ephemeral_storage"]["usedBytes"] == 75
+    assert got["pods"][0]["volumes"][0]["usage"]["usedBytes"] == 50
+    assert set(inspect.signature(server.get_k3s_resource_usage).parameters) == {"limit"}
+
+
 def test_k3s_pods_normalize_api_items(monkeypatch: pytest.MonkeyPatch) -> None:
     server = _load(monkeypatch, "/", "")
     monkeypatch.setattr(
