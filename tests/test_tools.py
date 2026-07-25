@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -30,6 +32,9 @@ def _load(
     du_timeout_seconds: str | None = None,
     k3s_volume_roots: str | None = None,
     max_k3s_volume_paths: str | None = None,
+    k3s_node_name: str | None = None,
+    freshness_checks: str | None = None,
+    k3s_condition_resources: str | None = None,
 ) -> ModuleType:
     """Reimport the server module with ROOTFS + allowlist env applied at import time."""
     monkeypatch.setenv("ROOTFS", tmp_root)
@@ -67,6 +72,21 @@ def _load(
         monkeypatch.delenv("NODE_STATS_MAX_K3S_VOLUME_PATHS", raising=False)
     else:
         monkeypatch.setenv("NODE_STATS_MAX_K3S_VOLUME_PATHS", max_k3s_volume_paths)
+    if k3s_node_name is None:
+        monkeypatch.delenv("NODE_STATS_K3S_NODE_NAME", raising=False)
+    else:
+        monkeypatch.setenv("NODE_STATS_K3S_NODE_NAME", k3s_node_name)
+    if freshness_checks is None:
+        monkeypatch.delenv("NODE_STATS_FRESHNESS_CHECKS", raising=False)
+    else:
+        monkeypatch.setenv("NODE_STATS_FRESHNESS_CHECKS", freshness_checks)
+    if k3s_condition_resources is None:
+        monkeypatch.delenv("NODE_STATS_K3S_CONDITION_RESOURCES", raising=False)
+    else:
+        monkeypatch.setenv(
+            "NODE_STATS_K3S_CONDITION_RESOURCES",
+            k3s_condition_resources,
+        )
     import node_stats_mcp.server as server
 
     return importlib.reload(server)
@@ -471,6 +491,233 @@ def test_k3s_resource_usage_normalizes_and_bounds_kubelet_summary(
     assert set(inspect.signature(server.get_k3s_resource_usage).parameters) == {"limit"}
 
 
+def test_k3s_node_health_filters_and_bounds_recent_relevant_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _load(monkeypatch, "/", "")
+    node = {
+        "metadata": {
+            "name": "kai-server",
+            "creationTimestamp": "2026-07-01T00:00:00Z",
+        },
+        "spec": {
+            "taints": [{"key": "maintenance", "effect": "NoSchedule"}],
+        },
+        "status": {
+            "capacity": {"cpu": "8", "memory": "32Gi"},
+            "allocatable": {"cpu": "7500m", "memory": "30Gi"},
+            "conditions": [
+                {
+                    "type": "Ready",
+                    "status": "True",
+                    "reason": "KubeletReady",
+                    "lastTransitionTime": "2026-07-20T00:00:00Z",
+                }
+            ],
+        },
+    }
+    pod = {
+        "metadata": {"name": "app", "namespace": "apps", "uid": "pod-uid"},
+        "spec": {"nodeName": "kai-server"},
+    }
+    events = [
+        {
+            "metadata": {
+                "namespace": "apps",
+                "creationTimestamp": "2099-07-25T00:00:00Z",
+            },
+            "type": "Normal",
+            "reason": "Pulled",
+            "message": "image present",
+            "involvedObject": {
+                "kind": "Pod",
+                "namespace": "apps",
+                "name": "app",
+                "uid": "pod-uid",
+            },
+        },
+        {
+            "metadata": {"creationTimestamp": "2099-07-25T00:00:00Z"},
+            "type": "Warning",
+            "reason": "VolumeFailed",
+            "message": "volume failed",
+            "involvedObject": {"kind": "PersistentVolume", "name": "data"},
+        },
+        {
+            "metadata": {"creationTimestamp": "2099-07-25T00:00:00Z"},
+            "type": "Normal",
+            "reason": "Unrelated",
+            "involvedObject": {"kind": "Pod", "name": "other"},
+        },
+    ]
+    monkeypatch.setattr(server, "_k3s_node", lambda: (node, []))
+    monkeypatch.setattr(
+        server,
+        "_k8s_list",
+        lambda path: (
+            ([pod] if path == "/api/v1/pods" else events),
+            [],
+        ),
+    )
+
+    got = asyncio.run(server.get_k3s_node_health(limit=1, max_age_hours=24))
+
+    assert got["node"]["conditions"][0]["type"] == "Ready"
+    assert got["node"]["taints"][0]["effect"] == "NoSchedule"
+    assert got["event_count"] == 2
+    assert got["returned_event_count"] == 1
+    assert set(inspect.signature(server.get_k3s_node_health).parameters) == {
+        "limit",
+        "max_age_hours",
+    }
+
+
+def test_k3s_scheduled_work_reports_job_and_cronjob_freshness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _load(monkeypatch, "/", "")
+    jobs = [
+        {
+            "metadata": {
+                "name": "backup-123",
+                "namespace": "ops",
+                "creationTimestamp": "2026-07-25T01:00:00Z",
+                "ownerReferences": [{"kind": "CronJob", "name": "backup"}],
+            },
+            "spec": {"backoffLimit": 3},
+            "status": {
+                "startTime": "2026-07-25T01:00:00Z",
+                "completionTime": "2026-07-25T01:05:00Z",
+                "succeeded": 1,
+                "conditions": [{"type": "Complete", "status": "True"}],
+            },
+        }
+    ]
+    cronjobs = [
+        {
+            "metadata": {
+                "name": "backup",
+                "namespace": "ops",
+                "creationTimestamp": "2026-07-01T00:00:00Z",
+            },
+            "spec": {"schedule": "0 1 * * *", "concurrencyPolicy": "Forbid"},
+            "status": {
+                "lastScheduleTime": "2026-07-25T01:00:00Z",
+                "lastSuccessfulTime": "2026-07-25T01:05:00Z",
+            },
+        }
+    ]
+    monkeypatch.setattr(
+        server,
+        "_k8s_list",
+        lambda path: (
+            jobs if path == "/apis/batch/v1/jobs" else cronjobs,
+            [],
+        ),
+    )
+
+    got = asyncio.run(server.get_k3s_scheduled_work())
+
+    assert got["jobs"][0]["cronjob"] == "backup"
+    assert got["jobs"][0]["duration_seconds"] == 300
+    assert got["jobs"][0]["succeeded"] == 1
+    assert got["cronjobs"][0]["last_successful_age_seconds"] is not None
+    assert set(inspect.signature(server.get_k3s_scheduled_work).parameters) == {"limit"}
+
+
+def test_configured_freshness_uses_server_owned_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker = tmp_path / "var" / "lib" / "backup" / "last-success"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("success details are not returned")
+    os.utime(marker, (time.time() - 600, time.time() - 600))
+    config = json.dumps(
+        [
+            {
+                "name": "backup",
+                "path": "/var/lib/backup/last-success",
+                "max_age_seconds": 300,
+            },
+            {
+                "name": "missing",
+                "path": "/var/lib/backup/missing",
+                "max_age_seconds": 300,
+            },
+        ]
+    )
+    server = _load(monkeypatch, str(tmp_path), "", freshness_checks=config)
+
+    got = server.get_configured_freshness()
+
+    assert got["errors"] == []
+    assert got["checks"][0]["status"] == "stale"
+    assert got["checks"][0]["age_seconds"] >= 599
+    assert "text" not in got["checks"][0]
+    assert got["checks"][1]["status"] == "missing"
+    assert inspect.signature(server.get_configured_freshness).parameters == {}
+
+
+def test_k3s_configured_conditions_uses_server_owned_resource_types(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = json.dumps(
+        [
+            {
+                "name": "external-secrets",
+                "group": "external-secrets.io",
+                "version": "v1beta1",
+                "resource": "externalsecrets",
+                "namespace": "ops",
+            }
+        ]
+    )
+    server = _load(
+        monkeypatch,
+        "/",
+        "",
+        k3s_condition_resources=config,
+    )
+    requested_paths: list[str] = []
+
+    def fake_list(path: str):
+        requested_paths.append(path)
+        return (
+            [
+                {
+                    "metadata": {
+                        "name": "registry",
+                        "namespace": "ops",
+                        "generation": 3,
+                        "creationTimestamp": "2026-07-01T00:00:00Z",
+                    },
+                    "status": {
+                        "observedGeneration": 3,
+                        "conditions": [
+                            {
+                                "type": "Ready",
+                                "status": "False",
+                                "reason": "SecretSyncedError",
+                            }
+                        ],
+                    },
+                }
+            ],
+            [],
+        )
+
+    monkeypatch.setattr(server, "_k8s_list", fake_list)
+
+    got = asyncio.run(server.get_k3s_configured_conditions())
+
+    assert requested_paths == ["/apis/external-secrets.io/v1beta1/namespaces/ops/externalsecrets"]
+    assert got["sources"][0]["items"][0]["ready"] == "False"
+    assert got["sources"][0]["items"][0]["ready_condition_type"] == "Ready"
+    assert set(inspect.signature(server.get_k3s_configured_conditions).parameters) == {
+        "limit_per_source"
+    }
+
+
 def test_k3s_pods_normalize_api_items(monkeypatch: pytest.MonkeyPatch) -> None:
     server = _load(monkeypatch, "/", "")
     monkeypatch.setattr(
@@ -672,13 +919,20 @@ def _k3s_volume_api_items(claims: list[tuple[str, str]]) -> dict[str, list[dict]
                     "name": claim_name,
                     "namespace": "apps",
                     "uid": f"claim-uid-{index}",
+                    "finalizers": ["kubernetes.io/pvc-protection"],
                 },
                 "spec": {
                     "volumeName": volume_name,
                     "storageClassName": "local-path",
+                    "accessModes": ["ReadWriteOnce"],
+                    "volumeMode": "Filesystem",
                     "resources": {"requests": {"storage": "1Gi"}},
                 },
-                "status": {"phase": "Bound", "capacity": {"storage": "1Gi"}},
+                "status": {
+                    "phase": "Bound",
+                    "capacity": {"storage": "1Gi"},
+                    "conditions": [{"type": "FileSystemResizePending", "status": "False"}],
+                },
             }
         )
         pvs.append(
@@ -686,13 +940,18 @@ def _k3s_volume_api_items(claims: list[tuple[str, str]]) -> dict[str, list[dict]
                 "metadata": {
                     "name": volume_name,
                     "uid": f"volume-uid-{index}",
+                    "finalizers": ["kubernetes.io/pv-protection"],
                 },
                 "spec": {
                     "claimRef": {
                         "namespace": "apps",
                         "name": claim_name,
+                        "uid": f"claim-uid-{index}",
                     },
                     "storageClassName": "local-path",
+                    "accessModes": ["ReadWriteOnce"],
+                    "volumeMode": "Filesystem",
+                    "persistentVolumeReclaimPolicy": "Delete",
                     "capacity": {"storage": "1Gi"},
                     "hostPath": {"path": local_path},
                 },
@@ -744,6 +1003,12 @@ def test_k3s_volume_usage_joins_pvcs_pvs_and_pod_mounts(
     assert volume["storage_class"] == "local-path"
     assert volume["requested_bytes"] == 1024**3
     assert volume["capacity_bytes"] == 1024**3
+    assert volume["pvc_finalizers"] == ["kubernetes.io/pvc-protection"]
+    assert volume["pv_finalizers"] == ["kubernetes.io/pv-protection"]
+    assert volume["pvc_conditions"][0]["type"] == "FileSystemResizePending"
+    assert volume["access_modes"] == ["ReadWriteOnce"]
+    assert volume["volume_mode"] == "Filesystem"
+    assert volume["reclaim_policy"] == "Delete"
     assert volume["scan_status"] == "scanned"
     assert volume["usage"]["size_bytes"] > 0
     assert {mount["pod"] for mount in volume["pod_mounts"]} == {"pod-0", "pod-shared"}

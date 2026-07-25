@@ -8,13 +8,19 @@ Living inventory of what ships from this repo. One image, one process: a FastMCP
 - **get_memory_info** - virtual and swap memory (bytes + percent).
 - **get_disk_info** - per-partition usage and mount info, resolved under `ROOTFS`.
 - **get_filesystem_pressure** - root filesystem capacity, available bytes, inode pressure, and byte runway to warning/critical thresholds.
+- **get_node_pressure_stalls** - fixed Linux PSI, selected VM pressure, and bounded per-device block I/O counters.
 - **get_pressure_path_usage** - worker-thread one-level attribution beneath configured node-pressure roots such as logs, journald, kubelet, k3s, and containerd storage. Every discovered child receives a fair entry and time slice, preventing a large root or child from starving siblings. Per-child results include size, entries scanned, permission/scan errors, skipped different-filesystem entries, and timeout/truncation metadata.
 - **get_network_info** - aggregate and per-interface I/O counters (node-wide under hostNetwork).
 - **get_top_processes** - top N by cpu or memory (node-wide under hostPID).
 - **get_k3s_pods** - read-only namespace/pod/container inventory from the k3s API.
 - **get_k3s_container_memory** - approximate per-container memory from metrics-server or host cgroups.
 - **get_k3s_process_attribution** - top host processes annotated with namespace/pod/container when cgroup metadata resolves.
-- **get_k3s_volume_usage** - worker-thread local-volume scan joined to namespaces, PVCs, PVs, and pod/container mount paths. Namespace totals count each volume once, server-owned roots constrain every scan, fair per-volume budgets prevent starvation, and unowned root children remain visible as unattributed storage.
+- **get_k3s_resource_usage** - worker-thread kubelet Summary API view of node, runtime filesystem, system-container, pod, container, volume, network, and ephemeral-storage usage.
+- **get_k3s_node_health** - worker-thread node conditions, taints, capacity, allocatable resources, and recent relevant or warning events.
+- **get_k3s_volume_usage** - worker-thread local-volume scan joined to namespaces, PVCs, PVs, pod/container mount paths, and storage lifecycle state. Namespace totals count each volume once, server-owned roots constrain every scan, fair per-volume budgets prevent starvation, and unowned root children remain visible as unattributed storage.
+- **get_k3s_scheduled_work** - worker-thread Jobs and CronJobs with activity, failure, duration, and last-schedule or last-success timing.
+- **get_configured_freshness** - metadata-only freshness state for server-configured host success markers.
+- **get_k3s_configured_conditions** - normalized conditions from server-configured Kubernetes custom-resource types.
 - **get_system_snapshot** - one-shot overview: cpu, memory, load, boot time, uptime, logged-in users.
 - **stat_path** - size/mode/mtime/type for a path under the readable-root allowlist.
 - **read_text_head** - up to `max_bytes` (capped) of a text file under the allowlist.
@@ -25,6 +31,8 @@ Living inventory of what ships from this repo. One image, one process: a FastMCP
 - **Prefix-allowlisted file access** - `NODE_STATS_READABLE_ROOTS` (colon-separated, empty by default) gates `stat_path` / `read_text_head`. Paths resolve real (symlinks collapsed) and must sit under an allowed root. `NODE_STATS_MAX_READ_BYTES` caps read size.
 - **Fixed pressure scan paths** - `get_pressure_path_usage` only discovers immediate children beneath `NODE_STATS_PRESSURE_PATHS`, never a caller-supplied raw path. Nested configured paths are skipped when an ancestor already covers them. Root discovery, per-child traversal, total entries, and wall-clock time are capped.
 - **Fixed Kubernetes volume roots** - `get_k3s_volume_usage` accepts no path argument. The server resolves PV paths beneath `NODE_STATS_K3S_VOLUME_ROOTS`, rejects paths outside those roots, and bounds both one-level orphan discovery and recursive usage scans.
+- **Server-selected Kubernetes targets** - kubelet usage selects the configured node or the API's only node. Custom-resource condition reads derive API paths from validated server configuration. Callers supply neither node names nor API targets.
+- **Server-selected freshness markers** - `get_configured_freshness` accepts no path argument, resolves configured absolute paths beneath `ROOTFS`, and returns metadata without reading marker content.
 - **Network-gated reach** - the endpoint is meant to sit behind the tailnet / node boundary, not public.
 
 ## Configuration (env)
@@ -35,6 +43,9 @@ Living inventory of what ships from this repo. One image, one process: a FastMCP
 - `NODE_STATS_MAX_READ_BYTES` (default 65536).
 - `NODE_STATS_KUBECONFIG` (default `/etc/rancher/k3s/k3s.yaml`, interpreted inside `ROOTFS`) - host kubeconfig used for the k3s inventory when present.
 - `NODE_STATS_K8S_TIMEOUT_SECONDS` (default 3) - timeout for Kubernetes API reads.
+- `NODE_STATS_K3S_NODE_NAME` - optional fixed node for node-health and kubelet-summary reads. A cluster with exactly one node needs no setting.
+- `NODE_STATS_K3S_CONDITION_RESOURCES` (default `[]`) - JSON list of fixed custom-resource descriptors. Each object supplies `name`, `group`, `version`, `resource`, and optional `namespace`.
+- `NODE_STATS_FRESHNESS_CHECKS` (default `[]`) - JSON list of fixed host-marker descriptors. Each object supplies `name`, absolute `path`, and positive `max_age_seconds`.
 - `NODE_STATS_K3S_VOLUME_ROOTS` (default `/var/lib/rancher/k3s/storage`) - colon-separated fixed roots that may contain local PV paths.
 - `NODE_STATS_MAX_K3S_VOLUME_PATHS` (default 1000) - cap on local PV and unattributed child paths considered by one volume-usage request.
 - `NODE_STATS_DISK_WARN_PERCENT` (default 80).

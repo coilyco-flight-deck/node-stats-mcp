@@ -55,6 +55,8 @@ _MAX_READ_BYTES = int(os.environ.get("NODE_STATS_MAX_READ_BYTES", "65536"))
 _K8S_TIMEOUT_SECONDS = float(os.environ.get("NODE_STATS_K8S_TIMEOUT_SECONDS", "3"))
 _KUBECONFIG_PATH = os.environ.get("NODE_STATS_KUBECONFIG", "/etc/rancher/k3s/k3s.yaml")
 _K3S_NODE_NAME = os.environ.get("NODE_STATS_K3S_NODE_NAME")
+_FRESHNESS_CHECKS_JSON = os.environ.get("NODE_STATS_FRESHNESS_CHECKS", "[]")
+_K3S_CONDITION_RESOURCES_JSON = os.environ.get("NODE_STATS_K3S_CONDITION_RESOURCES", "[]")
 _DEFAULT_K3S_VOLUME_ROOTS = ("/var/lib/rancher/k3s/storage",)
 _K3S_VOLUME_ROOTS = tuple(
     path
@@ -612,6 +614,484 @@ def _k3s_resource_usage(limit: int) -> dict[str, Any]:
     }
 
 
+def _timestamp_age(value: str | None) -> dict[str, Any]:
+    timestamp = _parse_timestamp(value)
+    age_seconds = (datetime.now(UTC) - timestamp).total_seconds() if timestamp else None
+    return {
+        "timestamp": timestamp.isoformat() if timestamp else value,
+        "age_seconds": int(age_seconds) if age_seconds is not None else None,
+        "age": _format_age(age_seconds),
+    }
+
+
+def _normalize_condition(item: dict[str, Any]) -> dict[str, Any]:
+    transition = _timestamp_age(item.get("lastTransitionTime"))
+    return {
+        "type": item.get("type"),
+        "status": item.get("status"),
+        "reason": item.get("reason"),
+        "message": item.get("message"),
+        "observed_generation": item.get("observedGeneration"),
+        "last_transition_at": transition["timestamp"],
+        "last_transition_age_seconds": transition["age_seconds"],
+        "last_transition_age": transition["age"],
+    }
+
+
+def _normalize_conditions(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [_normalize_condition(item) for item in value if isinstance(item, dict)]
+
+
+def _ready_condition(conditions: list[dict[str, Any]]) -> dict[str, Any] | None:
+    preferred = ("ready", "healthy", "available", "synced", "reconciled")
+    by_type = {str(condition.get("type", "")).lower(): condition for condition in conditions}
+    for condition_type in preferred:
+        if condition_type in by_type:
+            return by_type[condition_type]
+    return None
+
+
+def _normalize_node_health(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata", {})
+    spec = item.get("spec", {})
+    status = item.get("status", {})
+    created = _timestamp_age(metadata.get("creationTimestamp"))
+    return {
+        "name": metadata.get("name"),
+        "created_at": created["timestamp"],
+        "age_seconds": created["age_seconds"],
+        "age": created["age"],
+        "unschedulable": bool(spec.get("unschedulable")),
+        "taints": [
+            {
+                "key": taint.get("key"),
+                "value": taint.get("value"),
+                "effect": taint.get("effect"),
+                "time_added": taint.get("timeAdded"),
+            }
+            for taint in spec.get("taints", [])
+            if isinstance(taint, dict)
+        ],
+        "capacity": status.get("capacity", {}),
+        "allocatable": status.get("allocatable", {}),
+        "addresses": [
+            {"type": address.get("type"), "address": address.get("address")}
+            for address in status.get("addresses", [])
+            if isinstance(address, dict)
+        ],
+        "conditions": _normalize_conditions(status.get("conditions")),
+    }
+
+
+def _event_observed_at(item: dict[str, Any]) -> str | None:
+    series = item.get("series", {})
+    metadata = item.get("metadata", {})
+    return (
+        item.get("eventTime")
+        or series.get("lastObservedTime")
+        or item.get("lastTimestamp")
+        or item.get("firstTimestamp")
+        or metadata.get("creationTimestamp")
+    )
+
+
+def _normalize_event(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata", {})
+    involved = item.get("involvedObject", {})
+    source = item.get("source", {})
+    observed = _timestamp_age(_event_observed_at(item))
+    series = item.get("series", {})
+    return {
+        "namespace": metadata.get("namespace"),
+        "type": item.get("type"),
+        "reason": item.get("reason"),
+        "message": item.get("message") or item.get("note"),
+        "count": series.get("count") or item.get("count"),
+        "object": {
+            "kind": involved.get("kind"),
+            "namespace": involved.get("namespace") or metadata.get("namespace"),
+            "name": involved.get("name"),
+        },
+        "source": (
+            item.get("reportingController")
+            or source.get("component")
+            or item.get("reportingInstance")
+        ),
+        "observed_at": observed["timestamp"],
+        "age_seconds": observed["age_seconds"],
+        "age": observed["age"],
+    }
+
+
+def _event_relevant_to_node(
+    item: dict[str, Any],
+    node_name: str,
+    pod_names: set[tuple[str, str]],
+    pod_uids: set[str],
+) -> bool:
+    involved = item.get("involvedObject", {})
+    kind = involved.get("kind")
+    if kind == "Node":
+        return involved.get("name") == node_name
+    if kind == "Pod":
+        namespace = involved.get("namespace") or item.get("metadata", {}).get("namespace")
+        return (str(namespace), str(involved.get("name"))) in pod_names or str(
+            involved.get("uid")
+        ) in pod_uids
+    return item.get("type") == "Warning"
+
+
+def _k3s_node_health(limit: int, max_age_hours: int) -> dict[str, Any]:
+    node_item, errors = _k3s_node()
+    if node_item is None:
+        return {
+            "node": None,
+            "events": [],
+            "event_count": 0,
+            "returned_event_count": 0,
+            "errors": errors,
+        }
+    node_name = str(node_item.get("metadata", {}).get("name"))
+    pod_items, pod_errors = _k8s_list("/api/v1/pods")
+    event_items, event_errors = _k8s_list("/api/v1/events")
+    errors.extend(f"pods: {error}" for error in pod_errors)
+    errors.extend(f"events: {error}" for error in event_errors)
+    node_pods = [item for item in pod_items if item.get("spec", {}).get("nodeName") == node_name]
+    pod_names = {
+        (
+            str(item.get("metadata", {}).get("namespace")),
+            str(item.get("metadata", {}).get("name")),
+        )
+        for item in node_pods
+    }
+    pod_uids = {
+        str(item.get("metadata", {}).get("uid"))
+        for item in node_pods
+        if item.get("metadata", {}).get("uid")
+    }
+    maximum_age_seconds = max(1, min(max_age_hours, 168)) * 3600
+    events: list[dict[str, Any]] = []
+    for item in event_items:
+        if not _event_relevant_to_node(item, node_name, pod_names, pod_uids):
+            continue
+        event = _normalize_event(item)
+        event_age = event.get("age_seconds")
+        if event_age is not None and event_age > maximum_age_seconds:
+            continue
+        events.append(event)
+    events.sort(
+        key=lambda event: (
+            event.get("age_seconds") is None,
+            event.get("age_seconds") or 0,
+        )
+    )
+    cap = max(1, min(limit, 100))
+    return {
+        "node": _normalize_node_health(node_item),
+        "events": events[:cap],
+        "event_count": len(events),
+        "returned_event_count": min(len(events), cap),
+        "max_age_hours": max(1, min(max_age_hours, 168)),
+        "errors": errors,
+    }
+
+
+def _normalize_job(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata", {})
+    spec = item.get("spec", {})
+    status = item.get("status", {})
+    created = _timestamp_age(metadata.get("creationTimestamp"))
+    started = _timestamp_age(status.get("startTime"))
+    completed = _timestamp_age(status.get("completionTime"))
+    start_time = _parse_timestamp(status.get("startTime"))
+    completion_time = _parse_timestamp(status.get("completionTime"))
+    duration_seconds = (
+        int((completion_time - start_time).total_seconds())
+        if start_time and completion_time
+        else None
+    )
+    owner = next(
+        (
+            ref
+            for ref in metadata.get("ownerReferences", [])
+            if isinstance(ref, dict) and ref.get("kind") == "CronJob"
+        ),
+        None,
+    )
+    return {
+        "namespace": metadata.get("namespace"),
+        "job": metadata.get("name"),
+        "cronjob": owner.get("name") if owner else None,
+        "created_at": created["timestamp"],
+        "age_seconds": created["age_seconds"],
+        "age": created["age"],
+        "start_at": started["timestamp"],
+        "start_age_seconds": started["age_seconds"],
+        "completion_at": completed["timestamp"],
+        "completion_age_seconds": completed["age_seconds"],
+        "duration_seconds": duration_seconds,
+        "active": int(status.get("active") or 0),
+        "succeeded": int(status.get("succeeded") or 0),
+        "failed": int(status.get("failed") or 0),
+        "ready": status.get("ready"),
+        "completions": spec.get("completions"),
+        "parallelism": spec.get("parallelism"),
+        "backoff_limit": spec.get("backoffLimit"),
+        "suspended": bool(spec.get("suspend")),
+        "conditions": _normalize_conditions(status.get("conditions")),
+    }
+
+
+def _normalize_cronjob(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata", {})
+    spec = item.get("spec", {})
+    status = item.get("status", {})
+    created = _timestamp_age(metadata.get("creationTimestamp"))
+    scheduled = _timestamp_age(status.get("lastScheduleTime"))
+    successful = _timestamp_age(status.get("lastSuccessfulTime"))
+    return {
+        "namespace": metadata.get("namespace"),
+        "cronjob": metadata.get("name"),
+        "schedule": spec.get("schedule"),
+        "time_zone": spec.get("timeZone"),
+        "suspended": bool(spec.get("suspend")),
+        "concurrency_policy": spec.get("concurrencyPolicy"),
+        "created_at": created["timestamp"],
+        "age_seconds": created["age_seconds"],
+        "age": created["age"],
+        "last_schedule_at": scheduled["timestamp"],
+        "last_schedule_age_seconds": scheduled["age_seconds"],
+        "last_schedule_age": scheduled["age"],
+        "last_successful_at": successful["timestamp"],
+        "last_successful_age_seconds": successful["age_seconds"],
+        "last_successful_age": successful["age"],
+        "active_jobs": [
+            {"namespace": ref.get("namespace"), "name": ref.get("name")}
+            for ref in status.get("active", [])[:100]
+            if isinstance(ref, dict)
+        ],
+    }
+
+
+def _k3s_scheduled_work(limit: int) -> dict[str, Any]:
+    job_items, job_errors = _k8s_list("/apis/batch/v1/jobs")
+    cronjob_items, cronjob_errors = _k8s_list("/apis/batch/v1/cronjobs")
+    jobs = [_normalize_job(item) for item in job_items]
+    cronjobs = [_normalize_cronjob(item) for item in cronjob_items]
+    jobs.sort(
+        key=lambda job: (
+            job["failed"] > 0,
+            job["active"] > 0,
+            -(job.get("start_age_seconds") or 0),
+        ),
+        reverse=True,
+    )
+    cronjobs.sort(
+        key=lambda cronjob: (
+            cronjob["suspended"],
+            cronjob.get("last_successful_age_seconds") or -1,
+        ),
+        reverse=True,
+    )
+    cap = max(1, min(limit, 100))
+    return {
+        "jobs": jobs[:cap],
+        "job_count": len(jobs),
+        "returned_job_count": min(len(jobs), cap),
+        "cronjobs": cronjobs[:cap],
+        "cronjob_count": len(cronjobs),
+        "returned_cronjob_count": min(len(cronjobs), cap),
+        "errors": [
+            *(f"jobs: {error}" for error in job_errors),
+            *(f"cronjobs: {error}" for error in cronjob_errors),
+        ],
+    }
+
+
+def _configured_objects(raw_value: str, setting: str) -> tuple[list[dict[str, Any]], list[str]]:
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        return [], [f"{setting}: invalid JSON: {exc.msg}"]
+    if not isinstance(value, list):
+        return [], [f"{setting}: expected a JSON list"]
+    objects: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, item in enumerate(value):
+        if isinstance(item, dict):
+            objects.append(item)
+        else:
+            errors.append(f"{setting}[{index}]: expected an object")
+    return objects, errors
+
+
+_CONFIG_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_K8S_API_TOKEN_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,252}$")
+
+
+def _configured_freshness() -> dict[str, Any]:
+    configs, errors = _configured_objects(_FRESHNESS_CHECKS_JSON, "NODE_STATS_FRESHNESS_CHECKS")
+    root = Path(ROOTFS).resolve()
+    now = time.time()
+    checks: list[dict[str, Any]] = []
+    for index, config in enumerate(configs):
+        name = config.get("name")
+        path = config.get("path")
+        max_age = config.get("max_age_seconds")
+        if not isinstance(name, str) or not _CONFIG_NAME_RE.fullmatch(name):
+            errors.append(f"freshness check {index}: invalid name")
+            continue
+        if not isinstance(path, str) or not path.startswith("/"):
+            errors.append(f"freshness check {name!r}: path must be absolute")
+            continue
+        if not isinstance(max_age, int | float) or max_age <= 0:
+            errors.append(f"freshness check {name!r}: max_age_seconds must be positive")
+            continue
+        target = _host_path(path).resolve()
+        if target != root and root not in target.parents:
+            errors.append(f"freshness check {name!r}: configured path escapes ROOTFS")
+            continue
+        check: dict[str, Any] = {
+            "name": name,
+            "path": path,
+            "max_age_seconds": int(max_age),
+        }
+        try:
+            path_stat = target.stat()
+        except FileNotFoundError:
+            check.update(
+                {
+                    "exists": False,
+                    "status": "missing",
+                    "mtime_epoch": None,
+                    "age_seconds": None,
+                    "age": None,
+                    "is_file": False,
+                    "is_dir": False,
+                    "size_bytes": None,
+                }
+            )
+        except OSError as exc:
+            check.update({"exists": None, "status": "error", "error": str(exc)})
+        else:
+            age_seconds = int(now - path_stat.st_mtime)
+            status = (
+                "clock_skew"
+                if age_seconds < -300
+                else "stale"
+                if age_seconds > max_age
+                else "fresh"
+            )
+            check.update(
+                {
+                    "exists": True,
+                    "status": status,
+                    "mtime_epoch": path_stat.st_mtime,
+                    "age_seconds": age_seconds,
+                    "age": _format_age(age_seconds),
+                    "is_file": stat.S_ISREG(path_stat.st_mode),
+                    "is_dir": stat.S_ISDIR(path_stat.st_mode),
+                    "size_bytes": path_stat.st_size,
+                }
+            )
+        checks.append(check)
+    return {"checks": checks, "configured_check_count": len(configs), "errors": errors}
+
+
+def _condition_resource_path(config: dict[str, Any]) -> tuple[str | None, str | None]:
+    group = config.get("group")
+    version = config.get("version")
+    resource = config.get("resource")
+    namespace = config.get("namespace")
+    tokens = {
+        "group": group,
+        "version": version,
+        "resource": resource,
+    }
+    for field, value in tokens.items():
+        if not isinstance(value, str) or not _K8S_API_TOKEN_RE.fullmatch(value):
+            return None, f"invalid {field}"
+    if namespace is not None and (
+        not isinstance(namespace, str) or not _K8S_API_TOKEN_RE.fullmatch(namespace)
+    ):
+        return None, "invalid namespace"
+    assert isinstance(group, str)
+    assert isinstance(version, str)
+    assert isinstance(resource, str)
+    base = f"/apis/{quote(group, safe='.')}/{quote(version, safe='')}"
+    if namespace:
+        base += f"/namespaces/{quote(namespace, safe='')}"
+    return f"{base}/{quote(resource, safe='')}", None
+
+
+def _normalize_condition_resource_item(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata", {})
+    status = item.get("status", {})
+    created = _timestamp_age(metadata.get("creationTimestamp"))
+    conditions = _normalize_conditions(status.get("conditions"))
+    ready = _ready_condition(conditions)
+    return {
+        "namespace": metadata.get("namespace"),
+        "name": metadata.get("name"),
+        "generation": metadata.get("generation"),
+        "observed_generation": status.get("observedGeneration"),
+        "deletion_timestamp": metadata.get("deletionTimestamp"),
+        "created_at": created["timestamp"],
+        "age_seconds": created["age_seconds"],
+        "age": created["age"],
+        "ready": ready.get("status") if ready else None,
+        "ready_condition_type": ready.get("type") if ready else None,
+        "conditions": conditions,
+    }
+
+
+def _k3s_configured_conditions(limit_per_source: int) -> dict[str, Any]:
+    configs, errors = _configured_objects(
+        _K3S_CONDITION_RESOURCES_JSON,
+        "NODE_STATS_K3S_CONDITION_RESOURCES",
+    )
+    cap = max(1, min(limit_per_source, 100))
+    sources: list[dict[str, Any]] = []
+    for index, config in enumerate(configs):
+        name = config.get("name")
+        if not isinstance(name, str) or not _CONFIG_NAME_RE.fullmatch(name):
+            errors.append(f"condition resource {index}: invalid name")
+            continue
+        path, path_error = _condition_resource_path(config)
+        if path_error:
+            errors.append(f"condition resource {name!r}: {path_error}")
+            continue
+        items, source_errors = _k8s_list(str(path))
+        normalized = [_normalize_condition_resource_item(item) for item in items]
+        normalized.sort(
+            key=lambda item: (
+                item["ready"] not in ("True", True),
+                item.get("age_seconds") or 0,
+            ),
+            reverse=True,
+        )
+        sources.append(
+            {
+                "name": name,
+                "group": config["group"],
+                "version": config["version"],
+                "resource": config["resource"],
+                "namespace": config.get("namespace"),
+                "items": normalized[:cap],
+                "item_count": len(normalized),
+                "returned_item_count": min(len(normalized), cap),
+                "errors": source_errors,
+            }
+        )
+    return {
+        "sources": sources,
+        "configured_source_count": len(configs),
+        "errors": errors,
+    }
+
+
 def _normalize_container_id(container_id: str | None) -> str | None:
     if not container_id:
         return None
@@ -802,6 +1282,11 @@ def _normalize_pvc(item: dict[str, Any]) -> dict[str, Any]:
         "persistent_volume": spec.get("volumeName"),
         "storage_class": spec.get("storageClassName"),
         "phase": status.get("phase"),
+        "deletion_timestamp": metadata.get("deletionTimestamp"),
+        "finalizers": (metadata.get("finalizers") or [])[:100],
+        "access_modes": (spec.get("accessModes") or [])[:100],
+        "volume_mode": spec.get("volumeMode"),
+        "conditions": _normalize_conditions(status.get("conditions")),
         "requested_bytes": _parse_quantity(
             spec.get("resources", {}).get("requests", {}).get("storage")
         ),
@@ -821,8 +1306,16 @@ def _normalize_pv(item: dict[str, Any]) -> dict[str, Any]:
         "persistent_volume_uid": metadata.get("uid"),
         "namespace": claim.get("namespace"),
         "persistent_volume_claim": claim.get("name"),
+        "persistent_volume_claim_uid": claim.get("uid"),
         "storage_class": spec.get("storageClassName"),
         "phase": status.get("phase"),
+        "deletion_timestamp": metadata.get("deletionTimestamp"),
+        "finalizers": (metadata.get("finalizers") or [])[:100],
+        "access_modes": (spec.get("accessModes") or [])[:100],
+        "volume_mode": spec.get("volumeMode"),
+        "reclaim_policy": spec.get("persistentVolumeReclaimPolicy"),
+        "status_reason": status.get("reason"),
+        "status_message": status.get("message"),
         "capacity_bytes": _parse_quantity(spec.get("capacity", {}).get("storage")),
         "local_path": host_path or local_path,
         "local_path_source": "hostPath" if host_path else "local" if local_path else None,
@@ -1014,6 +1507,29 @@ def get_node_pressure_stalls(limit: int = 20) -> dict[str, Any]:
 async def get_k3s_resource_usage(limit: int = 20) -> dict[str, Any]:
     """Bounded node and pod usage from this node's kubelet Summary API."""
     return await asyncio.to_thread(_k3s_resource_usage, limit)
+
+
+async def get_k3s_node_health(limit: int = 50, max_age_hours: int = 24) -> dict[str, Any]:
+    """Node conditions, taints, capacity, and bounded recent relevant events."""
+    return await asyncio.to_thread(_k3s_node_health, limit, max_age_hours)
+
+
+async def get_k3s_scheduled_work(limit: int = 50) -> dict[str, Any]:
+    """Bounded Jobs and CronJobs with failure, activity, and last-success timing."""
+    return await asyncio.to_thread(_k3s_scheduled_work, limit)
+
+
+def get_configured_freshness() -> dict[str, Any]:
+    """Freshness of server-configured host marker paths, without reading their content."""
+    return _configured_freshness()
+
+
+async def get_k3s_configured_conditions(limit_per_source: int = 50) -> dict[str, Any]:
+    """Conditions for server-configured Kubernetes custom-resource types."""
+    return await asyncio.to_thread(
+        _k3s_configured_conditions,
+        limit_per_source,
+    )
 
 
 def _allowed_roots() -> list[Path]:
@@ -1511,6 +2027,16 @@ def _k3s_volume_inventory() -> tuple[list[dict[str, Any]], list[str]]:
                 "storage_class": pvc["storage_class"] or pv.get("storage_class"),
                 "pvc_phase": pvc["phase"],
                 "pv_phase": pv.get("phase"),
+                "pvc_deletion_timestamp": pvc["deletion_timestamp"],
+                "pv_deletion_timestamp": pv.get("deletion_timestamp"),
+                "pvc_finalizers": pvc["finalizers"],
+                "pv_finalizers": pv.get("finalizers", []),
+                "pvc_conditions": pvc["conditions"],
+                "access_modes": pvc["access_modes"] or pv.get("access_modes", []),
+                "volume_mode": pvc["volume_mode"] or pv.get("volume_mode"),
+                "reclaim_policy": pv.get("reclaim_policy"),
+                "pv_status_reason": pv.get("status_reason"),
+                "pv_status_message": pv.get("status_message"),
                 "requested_bytes": pvc["requested_bytes"],
                 "capacity_bytes": pvc["capacity_bytes"] or pv.get("capacity_bytes"),
                 "local_path_source": pv.get("local_path_source"),
@@ -1534,6 +2060,16 @@ def _k3s_volume_inventory() -> tuple[list[dict[str, Any]], list[str]]:
                 "storage_class": pv["storage_class"],
                 "pvc_phase": None,
                 "pv_phase": pv["phase"],
+                "pvc_deletion_timestamp": None,
+                "pv_deletion_timestamp": pv["deletion_timestamp"],
+                "pvc_finalizers": [],
+                "pv_finalizers": pv["finalizers"],
+                "pvc_conditions": [],
+                "access_modes": pv["access_modes"],
+                "volume_mode": pv["volume_mode"],
+                "reclaim_policy": pv["reclaim_policy"],
+                "pv_status_reason": pv["status_reason"],
+                "pv_status_message": pv["status_message"],
                 "requested_bytes": None,
                 "capacity_bytes": pv["capacity_bytes"],
                 "local_path_source": pv["local_path_source"],
@@ -1852,6 +2388,10 @@ for _tool in (
     get_k3s_volume_usage,
     get_node_pressure_stalls,
     get_k3s_resource_usage,
+    get_k3s_node_health,
+    get_k3s_scheduled_work,
+    get_configured_freshness,
+    get_k3s_configured_conditions,
     stat_path,
     read_text_head,
 ):
