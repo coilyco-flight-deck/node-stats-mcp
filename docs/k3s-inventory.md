@@ -40,4 +40,3 @@
 - The deployment's Kubernetes identity needs read access only for the core, batch, metrics, selected-node proxy, and explicitly configured custom-resource APIs that the tools use.
 - Volume scans run in a worker thread and divide the request's entry and time budgets across discovered paths.
 - Truncation, timeout, scan errors, permission errors, and cross-filesystem skips stay visible per volume.
-- Kubernetes API tools that combine multiple requests run in a worker thread so fast node tools remain responsive.
