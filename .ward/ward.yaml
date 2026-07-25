@@ -36,7 +36,7 @@ catalog:
   system: infrastructure
   owner: kai
   lifecycle: production
-  description: "Node-local MCP battery: reads Linux contention plus k3s health, usage, scheduled work, and storage attribution over streamable-HTTP. Deployed as a hostPID+hostNetwork pod pinned to one node; deploy surface lives in coilyco-bridge/deploy."
+  description: "Node-local MCP battery that reads Linux contention plus k3s health, usage, scheduled work, and storage attribution. It serves streamable-HTTP tools and bounded OTLP metrics and logs. The deploy surface lives in coilyco-bridge/deploy."
   dependsOn: []
   providesApis:
     - node-stats-mcp

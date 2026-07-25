@@ -41,6 +41,14 @@ Traversal runs in a worker thread, so fast tools remain responsive. The request 
 
 `get_configured_freshness` reports whether server-declared success markers are fresh, stale, missing, or affected by clock skew. It returns metadata only, never marker contents. Kubernetes scheduled-work timing and configured custom-resource conditions provide the corresponding cluster view.
 
+## SigNoz export
+
+The same image includes `node-stats-exporter`, a dependency-free OTLP/HTTP JSON exporter intended to run as a sidecar beside the MCP server. It collects the fast contention, kubelet, health, scheduled-work, freshness, configured-condition, and root-filesystem sources every minute by default. The slower local-volume scan runs every 15 minutes by default.
+
+Metrics use stable node, namespace, configured-resource, device, CronJob, freshness-check, and PVC attributes. Pod, container, process, event-object, and generated PV names stay out of metric attributes. One bounded structured log per source retains the detailed snapshot, including pod and event detail. Oversized logs become valid truncation envelopes rather than invalid partial JSON.
+
+The two processes fail independently. Collector errors do not stop collection, and exporter errors cannot take down the MCP server. See [docs/signoz-export.md](docs/signoz-export.md) for the data model, bounds, and configuration.
+
 ## Run it locally
 
 ```sh
@@ -56,6 +64,7 @@ Dev commands are declared in [`.ward/ward.yaml`](.ward/ward.yaml). Run them as `
 
 - [AGENTS.md](AGENTS.md) - agent operating context for this repo.
 - [docs/FEATURES.md](docs/FEATURES.md) - inventory of what ships today.
+- [docs/signoz-export.md](docs/signoz-export.md) - bounded OTLP metrics and structured logs.
 - [.ward/ward.yaml](.ward/ward.yaml) - allowlisted commands + catalog block.
 - [coilyco-bridge/deploy `services/node-stats-mcp`](https://forgejo.coilysiren.me/coilyco-bridge/deploy) - the k3s deploy surface.
 

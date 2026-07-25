@@ -1,7 +1,7 @@
 [project]
 name = "node-stats-mcp"
 version = "0.1.0"
-description = "Node-local MCP battery: host CPU/memory/disk/load/network/process introspection over streamable-HTTP."
+description = "Node-local MCP battery with streamable-HTTP tools and bounded OTLP export."
 readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "MIT" }
@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 node-stats-mcp = "node_stats_mcp.__main__:main"
+node-stats-exporter = "node_stats_mcp.exporter:main"
 
 [tool.uv]
 managed = true
