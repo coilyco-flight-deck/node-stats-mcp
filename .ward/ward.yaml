@@ -1,33 +1,30 @@
 # Per-repo command allowlist for node-stats-mcp (the `ward` gate).
 #
-# `ward lint` enforces: each command's `run` equals `make <verb>`, the Makefile
-# declares that target, and the description equals the target's `## desc`.
-#
 # Deploy verbs are deliberately absent - the deploy surface lives in
 # coilyco-bridge/deploy/services/node-stats-mcp per the layer invariant
 # (source -> deploy).
 
 commands:
   sync:
-    run: make sync
+    run: uv sync --group dev
     description: uv lock + uv sync with dev deps.
   test:
-    run: make test
+    run: uv run pytest
     description: Run the pytest suite.
   lint:
-    run: make lint
+    run: bash scripts/ward-quality.sh check
     description: ruff check + ruff format --check + mypy on src/ and tests/.
   fmt:
-    run: make fmt
+    run: bash scripts/ward-quality.sh format
     description: Apply ruff fixes and formatting in place.
   precommit:
-    run: make precommit
+    run: uv run pre-commit run --all-files
     description: Run all pre-commit hooks against every file.
   build-docker:
-    run: make build-docker
+    run: docker build -t node-stats-mcp:local .
     description: Build the node-stats-mcp docker image locally.
   run:
-    run: make run
+    run: uv run node-stats-mcp
     description: Run the MCP server locally over streamable-HTTP on :8080.
 
 catalog:

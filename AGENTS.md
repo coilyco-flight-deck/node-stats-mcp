@@ -16,7 +16,7 @@ The deploy surface lives in [coilyco-bridge/deploy](https://forgejo.coilysiren.m
 
 ## Commands
 
-Route every command through ward, never bare `make` / `uv` / `pytest`. Verbs are declared in [`.ward/ward.yaml`](.ward/ward.yaml); run them as `ward <verb>`.
+Route every command through Ward, never bare `uv` / `pytest`. Verbs are declared in [`.ward/ward.yaml`](.ward/ward.yaml). Run them as `ward exec <verb>`.
 
 ## Validation
 
