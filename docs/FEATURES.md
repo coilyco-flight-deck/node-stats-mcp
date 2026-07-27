@@ -75,7 +75,12 @@ Living inventory of what ships from this repo. One image provides a FastMCP serv
 
 ## Deploy
 
-Node-pinned hostPID + hostNetwork pod, image published to the in-cluster registry by [`.forgejo/workflows/build-publish.yml`](../.forgejo/workflows/build-publish.yml). Rollout lives in [coilyco-bridge/deploy](https://forgejo.coilysiren.me/coilyco-bridge/deploy) `services/node-stats-mcp`.
+Node-pinned hostPID + hostNetwork pod. A trusted main-only workflow publishes
+the private single-architecture image as
+`forgejo.coilysiren.me/coilyco-flight-deck/node-stats-mcp:<full-source-sha>`
+with the package-write credential and verifies the remote manifest. Rollout
+lives in [coilyco-bridge/deploy](https://forgejo.coilysiren.me/coilyco-bridge/deploy)
+`services/node-stats-mcp`, which receives only the package-read credential.
 
 ## See also
 

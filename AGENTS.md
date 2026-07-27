@@ -30,11 +30,19 @@ Route every command through Ward, never bare `uv` / `pytest`. Verbs are declared
 
 ## Cross-repo contracts
 
-The image is published to the in-cluster registry by [`.forgejo/workflows/build-publish.yml`](.forgejo/workflows/build-publish.yml) on every push to main. The deploy repo's rollout resolves that image by sha. Keep the dependency surface tiny (psutil + mcp); a new dependency needs a reason.
+The image is published privately to
+`forgejo.coilysiren.me/coilyco-flight-deck/node-stats-mcp:<full-source-sha>` by
+[`.forgejo/workflows/build-publish.yml`](.forgejo/workflows/build-publish.yml)
+on every push to main. The trusted publisher uses a package-write credential.
+The deploy repo receives only the package-read credential and rolls the same
+immutable reference. Keep the dependency surface tiny (psutil + mcp). A new
+dependency needs a reason.
 
 ## Release
 
-Push to main; CI builds and publishes the image. There is no version bump or tag ceremony. Deferred cleanup gets a Forgejo issue, never a silent skip.
+Push to main. CI tests, publishes one source-SHA image to Forgejo OCI, and
+proves the remote manifest exists. There is no version bump or moving tag.
+Deferred cleanup gets a Forgejo issue, never a silent skip.
 
 ## Agent rules
 

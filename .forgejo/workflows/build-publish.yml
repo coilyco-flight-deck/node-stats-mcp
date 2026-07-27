@@ -1,9 +1,9 @@
 name: build-publish
 
-# Tests, then builds and publishes the node-stats-mcp image to the in-cluster
-# registry on every push to main. No deploy stage here: rollout is driven from
+# Tests, then publishes the node-stats-mcp image to Forgejo OCI on every push
+# to main. No deploy stage here: rollout is driven from
 # coilyco-bridge/deploy/services/node-stats-mcp per the layer invariant
-# (source -> deploy). Mirrors coilyco-gaming/eco-app's build-publish.
+# (source -> deploy).
 
 on:
   push:
@@ -90,39 +90,13 @@ jobs:
           main()
           PY
   publish:
-    runs-on: docker
-    container: forgejo.coilysiren.me/coilyco-flight-deck/agentic-os:release
+    runs-on: deploy
     needs: [test]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      # The DinD sidecar shares the runner pod's netns on :2375, but the job
-      # container sits on a separate per-workflow bridge - so probe candidate
-      # hosts and pin the first that answers. Same shape as eco-app.
-      - name: Resolve docker host
-        run: |
-          set -euo pipefail
-          gw=$(node -e "const fs=require('fs');const l=(fs.readFileSync('/proc/net/route','utf8').split('\n').find(x=>x.split('\t')[1]==='00000000'))||'';const h=l.split(/\s+/)[2]||'';if(h){console.log(h.match(/../g).reverse().map(x=>parseInt(x,16)).join('.'))}" || true)
-          for h in "tcp://${gw}:2375" "${DOCKER_HOST:-}" tcp://localhost:2375 unix:///var/run/docker.sock; do
-            [ -z "$h" ] && continue
-            [ "$h" = "tcp://:2375" ] && continue
-            if docker -H "$h" info >/dev/null 2>&1; then
-              echo "docker daemon reachable at $h"
-              echo "DOCKER_HOST=$h" >> "$GITHUB_ENV"
-              exit 0
-            fi
-            echo "no docker daemon at $h"
-          done
-          echo "no reachable docker daemon" >&2
-          exit 1
-      # Build and push to the in-cluster registry. The DinD sidecar carries
-      # --insecure-registry=192.168.0.194:30500, so the plain-http push
-      # round-trips. Legacy builder (no buildx plugin in the static CLI).
-      - name: Build and push
-        run: |
-          set -euo pipefail
-          IMAGE=192.168.0.194:30500/node-stats-mcp:${{ github.sha }}
-          docker build -t "$IMAGE" .
-          docker push "$IMAGE"
+      - name: Publish immutable image
+        run: bash scripts/publish-image.sh
       - name: Alert Telegram on main failure
         if: ${{ failure() && github.ref == 'refs/heads/main' }}
         continue-on-error: true

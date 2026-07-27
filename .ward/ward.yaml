@@ -23,6 +23,9 @@ commands:
   build-docker:
     run: docker build -t node-stats-mcp:local .
     description: Build the node-stats-mcp docker image locally.
+  check-publish:
+    run: bash -n scripts/publish-image.sh
+    description: Validate the trusted Forgejo OCI publisher shell contract.
   run:
     run: uv run node-stats-mcp
     description: Run the MCP server locally over streamable-HTTP on :8080.

@@ -60,6 +60,15 @@ ward run     # streamable-HTTP MCP on :8080, endpoint at /mcp
 
 Dev commands are declared in [`.ward/ward.yaml`](.ward/ward.yaml). Run them as `ward <verb>`.
 
+## Image
+
+Every push to canonical `main` publishes the private single-architecture image
+`forgejo.coilysiren.me/coilyco-flight-deck/node-stats-mcp:<full-source-sha>`.
+The trusted publisher verifies the remote manifest. The deploy repository owns
+the separate package-read pull Secret and rolls that exact reference.
+The small single-architecture runtime avoids the concurrent-manifest and
+large-upload publisher paths.
+
 ## See also
 
 - [AGENTS.md](AGENTS.md) - agent operating context for this repo.
