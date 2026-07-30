@@ -7,14 +7,16 @@ FROM python:3.13-slim
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /app
-COPY pyproject.toml README.md /app/
+COPY pyproject.toml uv.lock README.md /app/
 COPY src /app/src
 
-# Install the project (and its deps) into the system environment. No lockfile:
-# the dependency surface is two libraries, so a resolved install is enough.
-RUN uv pip install --system --no-cache .
+# Install the exact dependency set exercised by CI. The image stays
+# self-contained under /app/.venv and exposes the project console scripts
+# through PATH.
+RUN uv sync --frozen --no-dev --no-editable
 
 ENV PORT=8080
+ENV PATH="/app/.venv/bin:${PATH}"
 EXPOSE 8080
 
 CMD ["node-stats-mcp"]

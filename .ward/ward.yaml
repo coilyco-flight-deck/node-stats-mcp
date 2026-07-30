@@ -23,6 +23,9 @@ commands:
   build-docker:
     run: docker build -t node-stats-mcp:local .
     description: Build the node-stats-mcp docker image locally.
+  smoke-docker:
+    run: docker run --rm --entrypoint python node-stats-mcp:local -c "import node_stats_mcp.server"
+    description: Prove the built image can import the production server entrypoint.
   check-publish:
     run: bash -n scripts/publish-image.sh
     description: Validate the trusted Forgejo OCI publisher shell contract.

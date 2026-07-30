@@ -33,6 +33,9 @@ printf '%s' "${REGISTRY_TOKEN}" \
 echo "==> building ${image}"
 docker build --pull -t "${image}" .
 
+echo "==> smoke-testing ${image}"
+docker run --rm --entrypoint python "${image}" -c "import node_stats_mcp.server"
+
 echo "==> publishing ${image}"
 docker push "${image}"
 
