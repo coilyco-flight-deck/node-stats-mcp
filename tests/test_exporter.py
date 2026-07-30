@@ -202,6 +202,37 @@ def test_collect_sources_preserves_a_source_exception(
     assert snapshots["kubelet"] == {"errors": []}
 
 
+def test_collect_sources_does_not_schedule_mcp_process_volume_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def empty_async(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"errors": []}
+
+    def fake_volume(
+        limit: int,
+        max_entries_per_volume: int,
+        *,
+        schedule_host_snapshot: bool,
+    ) -> dict[str, Any]:
+        assert limit == 10
+        assert max_entries_per_volume > 0
+        assert schedule_host_snapshot is False
+        return {"volumes": [], "errors": []}
+
+    monkeypatch.setattr(exporter.server, "get_node_pressure_stalls", lambda limit: {"errors": []})
+    monkeypatch.setattr(exporter.server, "get_k3s_resource_usage", empty_async)
+    monkeypatch.setattr(exporter.server, "get_k3s_node_health", empty_async)
+    monkeypatch.setattr(exporter.server, "get_k3s_scheduled_work", empty_async)
+    monkeypatch.setattr(exporter.server, "get_configured_freshness", lambda: {"errors": []})
+    monkeypatch.setattr(exporter.server, "get_k3s_configured_conditions", empty_async)
+    monkeypatch.setattr(exporter.server, "get_filesystem_pressure", lambda: {"root": {}})
+    monkeypatch.setattr(exporter.server, "_k3s_volume_usage", fake_volume)
+
+    snapshots = asyncio.run(exporter.collect_sources(10, include_volume=True))
+
+    assert snapshots["volumes"] == {"volumes": [], "errors": []}
+
+
 def test_run_cycle_posts_independent_bounded_metric_and_log_payloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -31,7 +31,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -39,6 +39,8 @@ from urllib.request import Request, urlopen
 
 import psutil
 from mcp.server.fastmcp import FastMCP
+
+from node_stats_mcp import storage
 
 # Host root inside the pod. The deployment mounts the node's / read-only at
 # /host and sets ROOTFS=/host. Bare local runs leave it at / (the real root).
@@ -96,6 +98,40 @@ _MAX_PRESSURE_CHILDREN_PER_ROOT = int(
     os.environ.get("NODE_STATS_MAX_PRESSURE_CHILDREN_PER_ROOT", "1000")
 )
 _DU_TIMEOUT_SECONDS = float(os.environ.get("NODE_STATS_DU_TIMEOUT_SECONDS", "10"))
+
+_HOST_USAGE_PROFILES_JSON = os.environ.get("NODE_STATS_HOST_USAGE_PROFILES", "")
+_HOST_USAGE_MAX_ENTRIES = int(os.environ.get("NODE_STATS_HOST_USAGE_MAX_ENTRIES", "5000000"))
+_HOST_USAGE_TIMEOUT_SECONDS = float(os.environ.get("NODE_STATS_HOST_USAGE_TIMEOUT_SECONDS", "900"))
+_HOST_USAGE_MAX_CHILDREN = int(os.environ.get("NODE_STATS_HOST_USAGE_MAX_CHILDREN", "10000"))
+_HOST_USAGE_STALE_SECONDS = int(os.environ.get("NODE_STATS_HOST_USAGE_STALE_SECONDS", "900"))
+_DEFAULT_HOST_USAGE_PROFILES = (
+    {"name": "root", "path": "/"},
+    {"name": "var", "path": "/var"},
+    {"name": "var-lib", "path": "/var/lib"},
+    {"name": "k3s", "path": "/var/lib/rancher/k3s"},
+    {"name": "k3s-storage", "path": "/var/lib/rancher/k3s/storage"},
+)
+
+_HOST_LOG_PATHS = tuple(
+    path for path in os.environ.get("NODE_STATS_HOST_LOG_PATHS", "/var/log").split(":") if path
+)
+_JOURNAL_PATHS = tuple(
+    path
+    for path in os.environ.get(
+        "NODE_STATS_JOURNAL_PATHS",
+        "/var/log/journal:/run/log/journal",
+    ).split(":")
+    if path
+)
+_MAX_HOST_LOG_ENTRIES = int(os.environ.get("NODE_STATS_MAX_HOST_LOG_ENTRIES", "500000"))
+_HOST_LOG_TIMEOUT_SECONDS = float(os.environ.get("NODE_STATS_HOST_LOG_TIMEOUT_SECONDS", "30"))
+_MAX_HOST_LOG_CHILDREN = int(os.environ.get("NODE_STATS_MAX_HOST_LOG_CHILDREN", "1000"))
+
+_MAX_DELETED_FILE_PIDS = int(os.environ.get("NODE_STATS_MAX_DELETED_FILE_PIDS", "4096"))
+_MAX_DELETED_FILE_FDS = int(os.environ.get("NODE_STATS_MAX_DELETED_FILE_FDS_PER_PROCESS", "4096"))
+_DELETED_FILE_TIMEOUT_SECONDS = float(
+    os.environ.get("NODE_STATS_DELETED_FILE_TIMEOUT_SECONDS", "10")
+)
 
 _VMSTAT_KEYS = (
     "oom_kill",
@@ -931,6 +967,145 @@ _CONFIG_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _K8S_API_TOKEN_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,252}$")
 
 
+def _positive_number(
+    config: dict[str, Any],
+    key: str,
+    default: int | float,
+    errors: list[str],
+    profile_name: str,
+) -> int | float:
+    value = config.get(key, default)
+    if not isinstance(value, int | float) or isinstance(value, bool) or value <= 0:
+        errors.append(f"host usage profile {profile_name!r}: {key} must be positive")
+        return default
+    return value
+
+
+def _host_usage_profiles() -> tuple[list[storage.UsageProfile], list[str]]:
+    if _HOST_USAGE_PROFILES_JSON.strip():
+        configs, errors = _configured_objects(
+            _HOST_USAGE_PROFILES_JSON,
+            "NODE_STATS_HOST_USAGE_PROFILES",
+        )
+    else:
+        configs = [dict(config) for config in _DEFAULT_HOST_USAGE_PROFILES]
+        errors = []
+    root = Path(ROOTFS).resolve()
+    profiles: list[storage.UsageProfile] = []
+    names: set[str] = set()
+    for index, config in enumerate(configs):
+        name = config.get("name")
+        path = config.get("path")
+        if not isinstance(name, str) or not _CONFIG_NAME_RE.fullmatch(name):
+            errors.append(f"host usage profile {index}: invalid name")
+            continue
+        if name in names:
+            errors.append(f"host usage profile {name!r}: duplicate name")
+            continue
+        if not isinstance(path, str) or not path.startswith("/"):
+            errors.append(f"host usage profile {name!r}: path must be absolute")
+            continue
+        target = _host_path(path).resolve()
+        if target != root and root not in target.parents:
+            errors.append(f"host usage profile {name!r}: configured path escapes ROOTFS")
+            continue
+        raw_excludes = config.get("exclude_paths", [])
+        if not isinstance(raw_excludes, list) or not all(
+            isinstance(exclude, str) and exclude.startswith("/") for exclude in raw_excludes
+        ):
+            errors.append(
+                f"host usage profile {name!r}: exclude_paths must be absolute path strings"
+            )
+            continue
+        exclude_paths = []
+        invalid_exclude = False
+        for exclude in raw_excludes:
+            excluded = _host_path(exclude).resolve()
+            if excluded != target and target not in excluded.parents:
+                errors.append(
+                    f"host usage profile {name!r}: exclusion {exclude!r} is outside the profile"
+                )
+                invalid_exclude = True
+                break
+            exclude_paths.append(exclude)
+        if invalid_exclude:
+            continue
+        stale_after = _positive_number(
+            config,
+            "stale_after_seconds",
+            _HOST_USAGE_STALE_SECONDS,
+            errors,
+            name,
+        )
+        max_entries = _positive_number(
+            config,
+            "max_entries",
+            _HOST_USAGE_MAX_ENTRIES,
+            errors,
+            name,
+        )
+        timeout = _positive_number(
+            config,
+            "timeout_seconds",
+            _HOST_USAGE_TIMEOUT_SECONDS,
+            errors,
+            name,
+        )
+        max_children = _positive_number(
+            config,
+            "max_children",
+            _HOST_USAGE_MAX_CHILDREN,
+            errors,
+            name,
+        )
+        profiles.append(
+            storage.UsageProfile(
+                name=name,
+                path=path,
+                exclude_paths=tuple(exclude_paths),
+                stale_after_seconds=int(stale_after),
+                max_entries=int(max_entries),
+                timeout_seconds=float(timeout),
+                max_children=int(max_children),
+            )
+        )
+        names.add(name)
+    return profiles, errors
+
+
+def _validated_host_paths(
+    configured_paths: tuple[str, ...],
+    setting: str,
+) -> tuple[tuple[str, ...], list[str]]:
+    root = Path(ROOTFS).resolve()
+    paths: list[str] = []
+    errors: list[str] = []
+    for index, path in enumerate(configured_paths):
+        if not path.startswith("/"):
+            errors.append(f"{setting}[{index}]: path must be absolute")
+            continue
+        target = _host_path(path).resolve()
+        if target != root and root not in target.parents:
+            errors.append(f"{setting}[{index}]: configured path escapes ROOTFS")
+            continue
+        if path not in paths:
+            paths.append(path)
+    return tuple(paths), errors
+
+
+_HOST_USAGE_PROFILES, _HOST_USAGE_PROFILE_ERRORS = _host_usage_profiles()
+_HOST_USAGE_SNAPSHOTS = storage.HostUsageSnapshots(ROOTFS, _HOST_USAGE_PROFILES)
+_HOST_LOG_PATHS, _HOST_LOG_PATH_ERRORS = _validated_host_paths(
+    _HOST_LOG_PATHS,
+    "NODE_STATS_HOST_LOG_PATHS",
+)
+_JOURNAL_PATHS, _JOURNAL_PATH_ERRORS = _validated_host_paths(
+    _JOURNAL_PATHS,
+    "NODE_STATS_JOURNAL_PATHS",
+)
+_HOST_LOG_CONFIGURATION_ERRORS = [*_HOST_LOG_PATH_ERRORS, *_JOURNAL_PATH_ERRORS]
+
+
 def _configured_freshness() -> dict[str, Any]:
     configs, errors = _configured_objects(_FRESHNESS_CHECKS_JSON, "NODE_STATS_FRESHNESS_CHECKS")
     root = Path(ROOTFS).resolve()
@@ -1496,7 +1671,12 @@ async def get_k3s_volume_usage(
     can tune result and entry caps but cannot supply a filesystem path. The API
     reads and traversal run in a worker thread so fast node tools stay responsive.
     """
-    return await asyncio.to_thread(_k3s_volume_usage, limit, max_entries_per_volume)
+    return await asyncio.to_thread(
+        _k3s_volume_usage,
+        limit,
+        max_entries_per_volume,
+        schedule_host_snapshot=True,
+    )
 
 
 def get_node_pressure_stalls(limit: int = 20) -> dict[str, Any]:
@@ -1552,8 +1732,8 @@ def _resolve_readable(path: str) -> Path:
 
 
 def _allocated_bytes(path_stat: os.stat_result) -> int:
-    blocks = getattr(path_stat, "st_blocks", 0)
-    if blocks:
+    blocks = getattr(path_stat, "st_blocks", None)
+    if blocks is not None:
         return int(blocks) * 512
     return int(path_stat.st_size)
 
@@ -2100,6 +2280,7 @@ def _scan_k3s_volume_paths(
             "timed_out": False,
             "truncated": False,
             "scan_errors": 0,
+            "permission_errors": 0,
         }
     total_budget = max(1, _MAX_DU_TOTAL_ENTRIES)
     entry_budget = max(
@@ -2135,10 +2316,38 @@ def _scan_k3s_volume_paths(
         "timed_out": any(scan["timed_out"] for scan in scans.values()),
         "truncated": any(scan["truncated"] for scan in scans.values()),
         "scan_errors": sum(scan["scan_errors"] for scan in scans.values()),
+        "permission_errors": sum(scan["permission_errors"] for scan in scans.values()),
     }
 
 
-def _k3s_volume_usage(limit: int, max_entries_per_volume: int) -> dict[str, Any]:
+def _k3s_volume_background_snapshot(limit: int) -> dict[str, Any]:
+    configured_roots = {str(PurePosixPath(path)) for path in _K3S_VOLUME_ROOTS}
+    profile = next(
+        (
+            candidate
+            for candidate in _HOST_USAGE_PROFILES
+            if str(PurePosixPath(candidate.path)) in configured_roots
+        ),
+        None,
+    )
+    if profile is None:
+        return {
+            "available": False,
+            "profile": None,
+            "reason": "no host usage profile matches a configured k3s volume root",
+        }
+    return {
+        "available": True,
+        **_HOST_USAGE_SNAPSHOTS.request(profile.name, limit=limit, refresh=False),
+    }
+
+
+def _k3s_volume_usage(
+    limit: int,
+    max_entries_per_volume: int,
+    *,
+    schedule_host_snapshot: bool,
+) -> dict[str, Any]:
     volumes, errors = _k3s_volume_inventory()
     roots = _resolved_k3s_volume_roots()
     paths_by_key: dict[str, Path] = {}
@@ -2149,6 +2358,8 @@ def _k3s_volume_usage(limit: int, max_entries_per_volume: int) -> dict[str, Any]
         if safe_path is None:
             volume["usage"] = None
             volume["scan_status"] = "outside_configured_roots" if candidate else "no_local_path"
+            volume["usage_complete"] = False if candidate else None
+            volume["usage_is_lower_bound"] = True if candidate else None
             continue
         volume["_local_path_key"] = str(safe_path)
         volume["local_path"] = _public_host_path(safe_path)
@@ -2179,9 +2390,18 @@ def _k3s_volume_usage(limit: int, max_entries_per_volume: int) -> dict[str, Any]
         if path_key and scan is None:
             volume["usage"] = None
             volume["scan_status"] = "path_limit"
+            volume["usage_complete"] = False
+            volume["usage_is_lower_bound"] = True
         elif scan is not None:
             volume["usage"] = scan
-            volume["scan_status"] = "missing" if not scan["exists"] else "scanned"
+            usage_complete = not (
+                scan["truncated"] or scan["permission_errors"] or scan["scan_errors"]
+            )
+            volume["usage_complete"] = usage_complete
+            volume["usage_is_lower_bound"] = not usage_complete
+            volume["scan_status"] = (
+                "missing" if not scan["exists"] else "scanned" if usage_complete else "partial"
+            )
         namespace = volume.get("namespace")
         if not namespace:
             continue
@@ -2192,6 +2412,8 @@ def _k3s_volume_usage(limit: int, max_entries_per_volume: int) -> dict[str, Any]
                 "used_bytes": 0,
                 "volume_count": 0,
                 "truncated_volume_count": 0,
+                "incomplete_volume_count": 0,
+                "used_bytes_complete": True,
                 "_pods": set(),
             },
         )
@@ -2199,7 +2421,15 @@ def _k3s_volume_usage(limit: int, max_entries_per_volume: int) -> dict[str, Any]
         rollup["_pods"].update(
             str(mount["pod"]) for mount in volume["pod_mounts"] if mount.get("pod")
         )
-        if scan is None or path_key in counted_paths:
+        if scan is None:
+            if path_key or volume["scan_status"] == "outside_configured_roots":
+                rollup["used_bytes_complete"] = False
+                rollup["incomplete_volume_count"] += 1
+            continue
+        if not volume["usage_complete"]:
+            rollup["used_bytes_complete"] = False
+            rollup["incomplete_volume_count"] += 1
+        if path_key in counted_paths:
             continue
         counted_paths.add(path_key)
         rollup["used_bytes"] += scan["size_bytes"]
@@ -2210,6 +2440,7 @@ def _k3s_volume_usage(limit: int, max_entries_per_volume: int) -> dict[str, Any]
     for rollup in namespace_rollups.values():
         pods = rollup.pop("_pods")
         rollup["pod_count"] = len(pods)
+        rollup["used_bytes_is_lower_bound"] = not rollup["used_bytes_complete"]
         namespaces.append(rollup)
     namespaces.sort(key=lambda item: item["used_bytes"], reverse=True)
 
@@ -2224,17 +2455,41 @@ def _k3s_volume_usage(limit: int, max_entries_per_volume: int) -> dict[str, Any]
     unattributed = [scans[str(path)] for path in unattributed_paths if str(path) in scans]
     unattributed.sort(key=lambda item: item["size_bytes"], reverse=True)
     cap = max(1, min(limit, 100))
+    complete = not (
+        errors
+        or discovery_truncated
+        or path_limit_truncated
+        or scan_summary["truncated"]
+        or scan_summary["scan_errors"]
+        or scan_summary["permission_errors"]
+        or any(
+            volume["scan_status"] in {"outside_configured_roots", "path_limit", "partial"}
+            for volume in volumes
+        )
+    )
     return {
         "volumes": volumes[:cap],
         "namespaces": namespaces,
         "unattributed_paths": unattributed[:cap],
         "configured_volume_roots": list(_K3S_VOLUME_ROOTS),
         "volume_count": len(volumes),
+        "volume_results_truncated": len(volumes) > cap,
         "unattributed_path_count": len(unattributed_paths),
         "path_limit": path_cap,
         "paths_scanned": len(scan_paths),
         "discovery_truncated": discovery_truncated or path_limit_truncated,
         **scan_summary,
+        "complete": complete,
+        "totals_are_lower_bounds": not complete,
+        "host_usage_snapshot": (
+            _k3s_volume_background_snapshot(cap)
+            if schedule_host_snapshot
+            else {
+                "available": False,
+                "profile": None,
+                "reason": "background snapshot scheduling is disabled in the exporter process",
+            }
+        ),
         "errors": errors,
         "same_filesystem_only": True,
     }
@@ -2300,6 +2555,67 @@ async def get_pressure_path_usage(
     never a raw path.
     """
     return await asyncio.to_thread(_pressure_path_usage, limit, max_entries_per_path)
+
+
+def get_host_usage_breakdown(
+    profile: str = "root",
+    limit: int = 20,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Cached mount-aware usage for one server-configured host profile.
+
+    The caller selects only a configured profile identifier. A missing, stale,
+    or explicitly refreshed snapshot is scanned on a daemon worker thread while
+    this request returns current cache state immediately. Every snapshot labels
+    complete totals versus lower bounds and reports filesystem and mount
+    exclusions, including bind-mount deduplication.
+    """
+    result = _HOST_USAGE_SNAPSHOTS.request(profile, limit=limit, refresh=refresh)
+    result["configuration_errors"] = list(_HOST_USAGE_PROFILE_ERRORS)
+    return result
+
+
+async def get_host_log_usage(limit: int = 20) -> dict[str, Any]:
+    """Bounded allocated usage for configured host log and journald roots.
+
+    Journald roots nested beneath a configured log root are scanned separately
+    and excluded from that parent, so aggregate bytes are not double-counted.
+    Callers can cap returned child detail but cannot choose a path or widen the
+    server-owned traversal limits.
+    """
+    result = await asyncio.to_thread(
+        storage.scan_log_usage,
+        ROOTFS,
+        _HOST_LOG_PATHS,
+        _JOURNAL_PATHS,
+        max_entries=max(1, _MAX_HOST_LOG_ENTRIES),
+        timeout_seconds=max(0.001, _HOST_LOG_TIMEOUT_SECONDS),
+        max_children=max(1, _MAX_HOST_LOG_CHILDREN),
+        limit=limit,
+    )
+    result["configuration_errors"] = list(_HOST_LOG_CONFIGURATION_ERRORS)
+    if _HOST_LOG_CONFIGURATION_ERRORS:
+        result["complete"] = False
+        result["totals_are_lower_bounds"] = True
+    return result
+
+
+async def get_deleted_open_files(limit: int = 20) -> dict[str, Any]:
+    """Bounded deleted-open-file summary from fixed proc metadata.
+
+    Results deduplicate inodes and distinguish disk-backed reclaimable files
+    from memfd, tmpfs, devices, container overlays, and other non-disk entries.
+    Target paths are used only to match mount metadata and are never returned.
+    Target contents are never opened.
+    """
+    return await asyncio.to_thread(
+        storage.deleted_open_files,
+        ROOTFS,
+        max_pids=max(1, _MAX_DELETED_FILE_PIDS),
+        max_fds_per_process=max(1, _MAX_DELETED_FILE_FDS),
+        timeout_seconds=max(0.001, _DELETED_FILE_TIMEOUT_SECONDS),
+        limit=limit,
+    )
 
 
 def get_network_info() -> dict[str, Any]:
@@ -2379,6 +2695,9 @@ for _tool in (
     get_disk_info,
     get_filesystem_pressure,
     get_pressure_path_usage,
+    get_host_usage_breakdown,
+    get_host_log_usage,
+    get_deleted_open_files,
     get_network_info,
     get_top_processes,
     get_system_snapshot,

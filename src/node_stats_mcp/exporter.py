@@ -140,7 +140,17 @@ async def collect_sources(limit: int, *, include_volume: bool) -> dict[str, dict
         ("filesystem", asyncio.to_thread(server.get_filesystem_pressure)),
     ]
     if include_volume:
-        collectors.append(("volumes", server.get_k3s_volume_usage(limit)))
+        collectors.append(
+            (
+                "volumes",
+                asyncio.to_thread(
+                    server._k3s_volume_usage,
+                    limit,
+                    server._MAX_DU_ENTRIES,
+                    schedule_host_snapshot=False,
+                ),
+            )
+        )
     values = await asyncio.gather(
         *(collector for _, collector in collectors),
         return_exceptions=True,

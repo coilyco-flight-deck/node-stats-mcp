@@ -33,7 +33,22 @@ Read-only by construction: every tool is a read, none mutate the host. File intr
 
 Traversal runs in a worker thread, so fast tools remain responsive. The request divides its total entry and wall-clock budgets across roots and children before scanning, preventing one large storage tree from starving its siblings. Nested configured roots are coalesced, with skipped overlaps reported instead of walking the same subtree twice. Callers select neither roots nor children.
 
-`get_k3s_volume_usage` narrows that disk view to local persistent volumes. It joins Kubernetes pod, PVC, and PV metadata to server-approved host paths, reports pod/container mount points, rolls unique volume bytes up by namespace, and separately reports storage-root children that no current PV owns. Fair entry and time slices keep one large volume from starving its siblings.
+`get_k3s_volume_usage` narrows that disk view to local persistent volumes. It joins Kubernetes pod, PVC, and PV metadata to server-approved host paths, reports pod/container mount points, rolls unique volume bytes up by namespace, and separately reports storage-root children that no current PV owns. Fair entry and time slices keep one large volume from starving its siblings. Volume and namespace results label complete usage versus lower bounds, and the response schedules or exposes the matching complete host-usage snapshot when a profile covers the configured storage root.
+
+`get_host_usage_breakdown` provides the complete drilldown path. A caller
+selects only a server-configured profile such as `root`, `var`, `var-lib`,
+`k3s`, or `k3s-storage`. The request returns cached state immediately and
+starts a missing, stale, or requested refresh on a background thread. Every
+snapshot states whether its totals are complete or lower bounds. Mount identity
+and exclusions show where different filesystems were skipped and where kubelet
+bind mounts were deduplicated.
+
+`get_host_log_usage` scans configured log and journald roots with fixed bounds.
+Nested journald roots count once. `get_deleted_open_files` reports
+inode-deduplicated deleted descriptors by disk-backed, memfd, tmpfs, device,
+container-overlay, and other classes without returning filenames or reading
+contents. See [docs/host-storage.md](docs/host-storage.md) for the operator
+workflow, snapshot contract, and configuration.
 
 ## Contention and freshness
 
@@ -74,6 +89,7 @@ large-upload publisher paths.
 - [AGENTS.md](AGENTS.md) - agent operating context for this repo.
 - [docs/FEATURES.md](docs/FEATURES.md) - inventory of what ships today.
 - [docs/signoz-export.md](docs/signoz-export.md) - bounded OTLP metrics and structured logs.
+- [docs/host-storage.md](docs/host-storage.md) - mount-aware host usage, log, and deleted-file attribution.
 - [.ward/ward.yaml](.ward/ward.yaml) - allowlisted commands + catalog block.
 - [coilyco-bridge/deploy `services/node-stats-mcp`](https://forgejo.coilysiren.me/coilyco-bridge/deploy) - the k3s deploy surface.
 

@@ -19,6 +19,9 @@ Living inventory of what ships from this repo. One image provides a FastMCP serv
 - **get_filesystem_pressure** - root filesystem capacity, available bytes, inode pressure, and byte runway to warning/critical thresholds.
 - **get_node_pressure_stalls** - fixed Linux PSI, selected VM pressure, and bounded per-device block I/O counters.
 - **get_pressure_path_usage** - worker-thread one-level attribution beneath configured node-pressure roots such as logs, journald, kubelet, k3s, and containerd storage. Every discovered child receives a fair entry and time slice, preventing a large root or child from starving siblings. Per-child results include size, entries scanned, permission/scan errors, skipped different-filesystem entries, and timeout/truncation metadata.
+- **get_host_usage_breakdown** - background snapshots for fixed profiles. Mount identity, filesystem exclusions, bind-mount deduplication, allocated and apparent bytes, freshness, errors, and explicit complete-versus-lower-bound state support a root-to-owner drilldown without a raw path.
+- **get_host_log_usage** - allocated usage for fixed log and journald roots. Nested journald roots are excluded from parent scans and counted separately.
+- **get_deleted_open_files** - worker-thread `/proc` metadata summary that deduplicates open inodes and separates disk-backed reclaimable files from linked, memfd, tmpfs, device, container-overlay, and other non-disk entries. Filenames and file contents are not returned.
 - **get_network_info** - aggregate and per-interface I/O counters (node-wide under hostNetwork).
 - **get_top_processes** - top N by cpu or memory (node-wide under hostPID).
 - **get_k3s_pods** - read-only namespace/pod/container inventory from the k3s API.
@@ -26,7 +29,7 @@ Living inventory of what ships from this repo. One image provides a FastMCP serv
 - **get_k3s_process_attribution** - top host processes annotated with namespace/pod/container when cgroup metadata resolves.
 - **get_k3s_resource_usage** - worker-thread kubelet Summary API view of node, runtime filesystem, system-container, pod, container, volume, network, and ephemeral-storage usage.
 - **get_k3s_node_health** - worker-thread node conditions, taints, capacity, allocatable resources, and recent relevant or warning events.
-- **get_k3s_volume_usage** - worker-thread local-volume scan joined to namespaces, PVCs, PVs, pod/container mount paths, and storage lifecycle state. Namespace totals count each volume once, server-owned roots constrain every scan, fair per-volume budgets prevent starvation, and unowned root children remain visible as unattributed storage.
+- **get_k3s_volume_usage** - worker-thread local-volume scan joined to namespaces, PVCs, PVs, pod/container mount paths, and storage lifecycle state. Namespace totals count each volume once, server-owned roots constrain every scan, fair per-volume budgets prevent starvation, and unowned root children remain visible as unattributed storage. Volume, namespace, and response totals label complete usage versus lower bounds, while a matching host-usage profile schedules or exposes the complete background snapshot.
 - **get_k3s_scheduled_work** - worker-thread Jobs and CronJobs with activity, failure, duration, and last-schedule or last-success timing.
 - **get_configured_freshness** - metadata-only freshness state for server-configured host success markers.
 - **get_k3s_configured_conditions** - normalized conditions from server-configured Kubernetes custom-resource types.
@@ -39,6 +42,9 @@ Living inventory of what ships from this repo. One image provides a FastMCP serv
 - **Read-only** - no tool mutates the host.
 - **Prefix-allowlisted file access** - `NODE_STATS_READABLE_ROOTS` (colon-separated, empty by default) gates `stat_path` / `read_text_head`. Paths resolve real (symlinks collapsed) and must sit under an allowed root. `NODE_STATS_MAX_READ_BYTES` caps read size.
 - **Fixed pressure scan paths** - `get_pressure_path_usage` only discovers immediate children beneath `NODE_STATS_PRESSURE_PATHS`, never a caller-supplied raw path. Nested configured paths are skipped when an ancestor already covers them. Root discovery, per-child traversal, total entries, and wall-clock time are capped.
+- **Fixed host usage profiles** - `get_host_usage_breakdown` accepts only a validated profile name from `NODE_STATS_HOST_USAGE_PROFILES`. Recursive scans run on daemon workers, snapshots identify complete totals versus lower bounds, and stale cache state triggers refresh without blocking the request.
+- **Mount-aware physical attribution** - host usage and log scans use Linux mountinfo to report filesystem source/type, exclude other filesystems, deduplicate bind or subtree mounts, and count hard-linked non-directory inodes once.
+- **Fixed log and proc scans** - log and journald roots come only from server configuration. Deleted-file collection walks bounded `/proc/<pid>/fd` metadata, returns no filename, and never opens target contents.
 - **Fixed Kubernetes volume roots** - `get_k3s_volume_usage` accepts no path argument. The server resolves PV paths beneath `NODE_STATS_K3S_VOLUME_ROOTS`, rejects paths outside those roots, and bounds both one-level orphan discovery and recursive usage scans.
 - **Server-selected Kubernetes targets** - kubelet usage selects the configured node or the API's only node. Custom-resource condition reads derive API paths from validated server configuration. Callers supply neither node names nor API targets.
 - **Server-selected freshness markers** - `get_configured_freshness` accepts no path argument, resolves configured absolute paths beneath `ROOTFS`, and returns metadata without reading marker content.
@@ -64,6 +70,19 @@ Living inventory of what ships from this repo. One image provides a FastMCP serv
 - `NODE_STATS_MAX_DU_ENTRIES` (default 200000) - per-child traversal cap for pressure scans.
 - `NODE_STATS_MAX_DU_TOTAL_ENTRIES` (default 200000) - shared traversal cap across all pressure children in one request.
 - `NODE_STATS_DU_TIMEOUT_SECONDS` (default 10) - wall-clock cap for one pressure request; timeout is returned as root and child metadata.
+- `NODE_STATS_HOST_USAGE_PROFILES` - JSON list of fixed usage profiles. Each object requires `name` and absolute `path`, with optional `exclude_paths`, `stale_after_seconds`, `max_entries`, `timeout_seconds`, and `max_children`.
+- `NODE_STATS_HOST_USAGE_MAX_ENTRIES` (default 5000000) - background snapshot entry cap when a profile does not override it.
+- `NODE_STATS_HOST_USAGE_TIMEOUT_SECONDS` (default 900) - background snapshot wall-clock cap when a profile does not override it.
+- `NODE_STATS_HOST_USAGE_MAX_CHILDREN` (default 10000) - immediate-child discovery cap when a profile does not override it.
+- `NODE_STATS_HOST_USAGE_STALE_SECONDS` (default 900) - cached snapshot freshness window when a profile does not override it.
+- `NODE_STATS_HOST_LOG_PATHS` (default `/var/log`) - colon-separated fixed log roots.
+- `NODE_STATS_JOURNAL_PATHS` (default `/var/log/journal:/run/log/journal`) - colon-separated fixed journald roots.
+- `NODE_STATS_MAX_HOST_LOG_ENTRIES` (default 500000) - shared entry cap for one host-log request.
+- `NODE_STATS_HOST_LOG_TIMEOUT_SECONDS` (default 30) - wall-clock cap for one host-log request.
+- `NODE_STATS_MAX_HOST_LOG_CHILDREN` (default 1000) - immediate-child cap for each log or journald root.
+- `NODE_STATS_MAX_DELETED_FILE_PIDS` (default 4096) - process cap for one deleted-file request.
+- `NODE_STATS_MAX_DELETED_FILE_FDS_PER_PROCESS` (default 4096) - descriptor cap per process.
+- `NODE_STATS_DELETED_FILE_TIMEOUT_SECONDS` (default 10) - wall-clock cap for one deleted-file request.
 - `NODE_STATS_OTLP_ENDPOINT` - collector base URL or OTLP signal URL. The exporter normalizes it to `/v1/metrics` and `/v1/logs`.
 - `NODE_STATS_EXPORT_INTERVAL_SECONDS` (default 60, bounded 15 to 3600).
 - `NODE_STATS_EXPORT_VOLUME_INTERVAL_SECONDS` (default 900, bounded to at least the fast interval and at most 86400).
@@ -88,6 +107,7 @@ lives in [coilyco-bridge/deploy](https://forgejo.coilysiren.me/coilyco-bridge/de
 - [../AGENTS.md](../AGENTS.md) - agent operating context.
 - [k3s-inventory.md](k3s-inventory.md) - k3s pod, container, and attribution walkthrough.
 - [signoz-export.md](signoz-export.md) - OTLP data model, bounds, and sidecar operation.
+- [host-storage.md](host-storage.md) - operator workflow and trust semantics for physical storage attribution.
 - [../.ward/ward.yaml](../.ward/ward.yaml) - allowlisted commands + catalog block.
 
 Cross-reference convention from [features-release-tooling.md](features-release-tooling.md).

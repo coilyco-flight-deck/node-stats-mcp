@@ -13,10 +13,11 @@ import importlib
 import inspect
 import json
 import os
+import stat
 import threading
 import time
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -35,6 +36,10 @@ def _load(
     k3s_node_name: str | None = None,
     freshness_checks: str | None = None,
     k3s_condition_resources: str | None = None,
+    host_usage_profiles: str | None = None,
+    host_log_paths: str | None = None,
+    journal_paths: str | None = None,
+    max_host_log_entries: str | None = None,
 ) -> ModuleType:
     """Reimport the server module with ROOTFS + allowlist env applied at import time."""
     monkeypatch.setenv("ROOTFS", tmp_root)
@@ -87,9 +92,46 @@ def _load(
             "NODE_STATS_K3S_CONDITION_RESOURCES",
             k3s_condition_resources,
         )
+    if host_usage_profiles is None:
+        monkeypatch.delenv("NODE_STATS_HOST_USAGE_PROFILES", raising=False)
+    else:
+        monkeypatch.setenv("NODE_STATS_HOST_USAGE_PROFILES", host_usage_profiles)
+    if host_log_paths is None:
+        monkeypatch.delenv("NODE_STATS_HOST_LOG_PATHS", raising=False)
+    else:
+        monkeypatch.setenv("NODE_STATS_HOST_LOG_PATHS", host_log_paths)
+    if journal_paths is None:
+        monkeypatch.delenv("NODE_STATS_JOURNAL_PATHS", raising=False)
+    else:
+        monkeypatch.setenv("NODE_STATS_JOURNAL_PATHS", journal_paths)
+    if max_host_log_entries is None:
+        monkeypatch.delenv("NODE_STATS_MAX_HOST_LOG_ENTRIES", raising=False)
+    else:
+        monkeypatch.setenv("NODE_STATS_MAX_HOST_LOG_ENTRIES", max_host_log_entries)
     import node_stats_mcp.server as server
 
     return importlib.reload(server)
+
+
+def _write_mountinfo(tmp_path: Path, extra_records: list[str] | None = None) -> str:
+    mountinfo = tmp_path / "proc" / "self" / "mountinfo"
+    mountinfo.parent.mkdir(parents=True, exist_ok=True)
+    device = tmp_path.stat().st_dev
+    device_id = f"{os.major(device)}:{os.minor(device)}"
+    records = [f"1 0 {device_id} / / rw,relatime - ext4 /dev/root rw"]
+    records.extend(extra_records or [])
+    mountinfo.write_text("\n".join(records) + "\n")
+    return device_id
+
+
+def _wait_for_host_snapshot(server: ModuleType, profile: str) -> dict:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        result = server.get_host_usage_breakdown(profile=profile, limit=100)
+        if result["snapshot"] is not None and not result["refresh"]["running"]:
+            return result
+        time.sleep(0.01)
+    raise AssertionError(f"host usage snapshot {profile!r} did not finish")
 
 
 def test_cpu_and_memory_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -385,6 +427,319 @@ def test_filesystem_pressure_stays_responsive_during_path_scan(
         return elapsed
 
     assert asyncio.run(run_concurrently()) < 0.1
+
+
+def test_host_usage_profile_background_snapshot_is_fixed_and_fresh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    storage_root = tmp_path / "var" / "lib" / "rancher" / "k3s" / "storage"
+    for name, size in (("forgejo", 300_000), ("runner", 200_000), ("registry", 100_000)):
+        volume = storage_root / name
+        volume.mkdir(parents=True)
+        (volume / "payload.bin").write_bytes(b"x" * size)
+    _write_mountinfo(tmp_path)
+    profiles = json.dumps(
+        [
+            {
+                "name": "k3s-storage",
+                "path": "/var/lib/rancher/k3s/storage",
+                "stale_after_seconds": 60,
+                "max_entries": 1000,
+                "timeout_seconds": 10,
+            }
+        ]
+    )
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        host_usage_profiles=profiles,
+    )
+
+    pending = server.get_host_usage_breakdown(profile="k3s-storage")
+    got = _wait_for_host_snapshot(server, "k3s-storage")
+    snapshot = got["snapshot"]
+
+    assert pending["snapshot_status"] == "pending"
+    assert pending["refresh"]["running"] is True
+    assert got["snapshot_stale"] is False
+    assert got["snapshot_age_seconds"] is not None
+    assert snapshot["status"] == "complete"
+    assert snapshot["complete"] is True
+    assert snapshot["totals_are_lower_bounds"] is False
+    assert [Path(child["path"]).name for child in snapshot["children"][:3]] == [
+        "forgejo",
+        "runner",
+        "registry",
+    ]
+    assert "path" not in inspect.signature(server.get_host_usage_breakdown).parameters
+    with pytest.raises(ValueError, match="unknown host usage profile"):
+        server.get_host_usage_breakdown(profile="/var/lib")
+
+
+def test_host_usage_snapshot_deduplicates_bind_mounts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    physical = tmp_path / "var" / "lib" / "rancher" / "k3s" / "storage" / "forgejo"
+    alias = tmp_path / "var" / "lib" / "kubelet" / "pods" / "forgejo"
+    physical.mkdir(parents=True)
+    alias.mkdir(parents=True)
+    (physical / "data.bin").write_bytes(b"x" * 100_000)
+    (alias / "data.bin").write_bytes(b"x" * 100_000)
+    device_id = _write_mountinfo(tmp_path)
+    mountinfo = tmp_path / "proc" / "self" / "mountinfo"
+    mountinfo.write_text(
+        mountinfo.read_text()
+        + (
+            f"2 1 {device_id} /var/lib/rancher/k3s/storage/forgejo "
+            "/var/lib/kubelet/pods/forgejo rw,relatime - ext4 /dev/root rw\n"
+        )
+    )
+    profiles = json.dumps(
+        [
+            {
+                "name": "var-lib",
+                "path": "/var/lib",
+                "max_entries": 1000,
+                "timeout_seconds": 10,
+            }
+        ]
+    )
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        host_usage_profiles=profiles,
+    )
+
+    snapshot = _wait_for_host_snapshot(server, "var-lib")["snapshot"]
+    children = {Path(child["path"]).name: child for child in snapshot["children"]}
+    excluded = snapshot["excluded_mounts"][0]
+
+    assert snapshot["filesystem"]["filesystem_id"] == device_id
+    assert excluded["path"] == "/var/lib/kubelet/pods/forgejo"
+    assert excluded["deduplicated"] is True
+    assert excluded["mount"]["mount_source"] == "/dev/root"
+    assert excluded["mount"]["mount_type"] == "ext4"
+    assert children["rancher"]["size_bytes"] > children["kubelet"]["size_bytes"]
+
+
+def test_host_usage_snapshot_marks_entry_cap_as_lower_bound(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tree = tmp_path / "large"
+    tree.mkdir()
+    for index in range(10):
+        (tree / f"{index}.bin").write_bytes(b"x" * 1024)
+    _write_mountinfo(tmp_path)
+    profiles = json.dumps(
+        [
+            {
+                "name": "root",
+                "path": "/",
+                "max_entries": 2,
+                "timeout_seconds": 10,
+            }
+        ]
+    )
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        host_usage_profiles=profiles,
+    )
+
+    snapshot = _wait_for_host_snapshot(server, "root")["snapshot"]
+
+    assert snapshot["status"] == "incomplete"
+    assert snapshot["complete"] is False
+    assert snapshot["totals_are_lower_bounds"] is True
+    assert snapshot["truncated"] is True
+    assert snapshot["entries_scanned"] == 2
+
+
+def test_host_usage_background_scan_does_not_block_fast_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "data").mkdir()
+    _write_mountinfo(tmp_path)
+    profiles = json.dumps([{"name": "root", "path": "/"}])
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        host_usage_profiles=profiles,
+    )
+    original_scan = server.storage.scan_usage_profile
+    scan_started = threading.Event()
+
+    def slow_scan(*args, **kwargs):
+        scan_started.set()
+        time.sleep(0.25)
+        return original_scan(*args, **kwargs)
+
+    monkeypatch.setattr(server.storage, "scan_usage_profile", slow_scan)
+    started = time.monotonic()
+    pending = server.get_host_usage_breakdown(profile="root")
+    elapsed = time.monotonic() - started
+
+    assert scan_started.wait(1)
+    assert elapsed < 0.1
+    assert pending["snapshot_status"] == "pending"
+    assert server.get_filesystem_pressure()["root"]["total_bytes"] > 0
+    _wait_for_host_snapshot(server, "root")
+
+
+def test_host_log_usage_separates_journald_and_counts_sparse_allocation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    app_log = tmp_path / "var" / "log" / "app" / "app.log"
+    journal = tmp_path / "var" / "log" / "journal" / "system.journal"
+    app_log.parent.mkdir(parents=True)
+    journal.parent.mkdir(parents=True)
+    with app_log.open("wb") as sparse:
+        sparse.truncate(128 * 1024 * 1024)
+    journal.write_bytes(b"x" * 4096)
+    _write_mountinfo(tmp_path)
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        host_log_paths="/var/log",
+        journal_paths="/var/log/journal",
+        max_host_log_entries="1000",
+    )
+
+    got = asyncio.run(server.get_host_log_usage(limit=20))
+    app_child = next(
+        child for child in got["log_roots"][0]["children"] if child["path"] == "/var/log/app"
+    )
+
+    assert got["complete"] is True
+    assert got["totals_are_lower_bounds"] is False
+    assert got["journald_roots"][0]["path"] == "/var/log/journal"
+    assert got["journald_roots"][0]["size_bytes"] > 0
+    assert app_child["apparent_bytes"] > app_child["size_bytes"]
+    assert got["log_roots"][0]["excluded_mounts"][0]["path"] == "/var/log/journal"
+    assert "path" not in inspect.signature(server.get_host_log_usage).parameters
+
+
+def test_host_log_usage_rejects_configured_root_escape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    outside = tmp_path.parent / "outside-logs"
+    outside.mkdir(exist_ok=True)
+    (outside / "secret.log").write_text("not scanned")
+    _write_mountinfo(tmp_path)
+    server = _load(
+        monkeypatch,
+        str(tmp_path),
+        "",
+        host_log_paths="/../outside-logs",
+        journal_paths="",
+    )
+
+    got = asyncio.run(server.get_host_log_usage())
+
+    assert got["log_roots"] == []
+    assert got["complete"] is False
+    assert got["totals_are_lower_bounds"] is True
+    assert "escapes ROOTFS" in got["configuration_errors"][0]
+
+
+def test_deleted_open_file_summary_excludes_memory_and_overlay_classes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from node_stats_mcp import storage
+
+    server = _load(monkeypatch, str(tmp_path), "")
+    assert "path" not in inspect.signature(server.get_deleted_open_files).parameters
+    proc_fds = tmp_path / "proc" / "100" / "fd"
+    proc_fds.mkdir(parents=True)
+    for fd_name in ("3", "4", "5", "6"):
+        (proc_fds / fd_name).symlink_to("/missing")
+    disk_file = tmp_path / "deleted.log"
+    disk_file.write_bytes(b"x" * 8192)
+    disk_fd = os.open(disk_file, os.O_RDONLY)
+    os.unlink(disk_file)
+    disk_stat = os.fstat(disk_fd)
+    disk_device = disk_stat.st_dev
+    tmpfs_device = os.makedev(0, 91)
+    overlay_device = os.makedev(0, 92)
+
+    def changed_stat(device: int, inode: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_dev=device,
+            st_ino=inode,
+            st_nlink=0,
+            st_size=disk_stat.st_size,
+            st_blocks=16,
+        )
+
+    fake_stats = {
+        "3": changed_stat(disk_device, 103),
+        "4": changed_stat(disk_device, 104),
+        "5": changed_stat(tmpfs_device, 105),
+        "6": changed_stat(overlay_device, 106),
+    }
+    targets = {
+        "3": "/var/log/deleted.log (deleted)",
+        "4": "/memfd:buffer (deleted)",
+        "5": "/run/tmp/deleted (deleted)",
+        "6": "/var/lib/containerd/deleted (deleted)",
+    }
+    disk_id = f"{os.major(disk_device)}:{os.minor(disk_device)}"
+    tmpfs_id = f"{os.major(tmpfs_device)}:{os.minor(tmpfs_device)}"
+    overlay_id = f"{os.major(overlay_device)}:{os.minor(overlay_device)}"
+    _write_mountinfo(
+        tmp_path,
+        [
+            f"2 1 {tmpfs_id} / /run rw - tmpfs tmpfs rw",
+            f"3 1 {overlay_id} / /var/lib/containerd rw - overlay overlay rw",
+        ],
+    )
+    mountinfo = tmp_path / "proc" / "self" / "mountinfo"
+    mountinfo.write_text(
+        mountinfo.read_text().replace(
+            mountinfo.read_text().split()[2],
+            disk_id,
+            1,
+        )
+    )
+    original_readlink = storage.os.readlink
+    original_stat = Path.stat
+
+    def fake_readlink(path: str | os.PathLike[str]) -> str:
+        candidate = Path(path)
+        if candidate.parent.name == "fd":
+            return targets[candidate.name]
+        return original_readlink(path)
+
+    def fake_path_stat(path: Path, *args, **kwargs):
+        if path.parent.name == "fd":
+            return fake_stats[path.name]
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage.os, "readlink", fake_readlink)
+    monkeypatch.setattr(Path, "stat", fake_path_stat)
+    try:
+        got = storage.deleted_open_files(
+            tmp_path,
+            max_pids=10,
+            max_fds_per_process=10,
+            timeout_seconds=2,
+            limit=10,
+        )
+    finally:
+        os.close(disk_fd)
+
+    categories = {entry["category"]: entry for entry in got["categories"]}
+    assert got["disk_backed_reclaimable_files"] == 1
+    assert got["disk_backed_reclaimable_bytes"] == fake_stats["3"].st_size
+    assert {"disk_backed_reclaimable", "memfd", "tmpfs", "container_overlay"} <= categories.keys()
+    assert got["paths_returned"] is False
+    assert got["contents_read"] is False
 
 
 def test_top_processes_validates_sort(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1010,12 +1365,18 @@ def test_k3s_volume_usage_joins_pvcs_pvs_and_pod_mounts(
     assert volume["volume_mode"] == "Filesystem"
     assert volume["reclaim_policy"] == "Delete"
     assert volume["scan_status"] == "scanned"
+    assert volume["usage_complete"] is True
+    assert volume["usage_is_lower_bound"] is False
     assert volume["usage"]["size_bytes"] > 0
     assert {mount["pod"] for mount in volume["pod_mounts"]} == {"pod-0", "pod-shared"}
     assert {mount["mount_path"] for mount in volume["pod_mounts"]} == {"/data"}
     assert got["namespaces"][0]["used_bytes"] == volume["usage"]["size_bytes"]
+    assert got["namespaces"][0]["used_bytes_complete"] is True
+    assert got["namespaces"][0]["used_bytes_is_lower_bound"] is False
     assert got["namespaces"][0]["pod_count"] == 2
     assert got["unattributed_paths"][0]["path"].replace("\\", "/").endswith("/volumes/orphan")
+    assert got["complete"] is True
+    assert got["totals_are_lower_bounds"] is False
 
 
 def test_k3s_volume_usage_rejects_paths_outside_fixed_roots(
@@ -1039,9 +1400,13 @@ def test_k3s_volume_usage_rejects_paths_outside_fixed_roots(
 
     assert "path" not in inspect.signature(server.get_k3s_volume_usage).parameters
     assert volume["scan_status"] == "outside_configured_roots"
+    assert volume["usage_complete"] is False
+    assert volume["usage_is_lower_bound"] is True
     assert volume["usage"] is None
     assert "local_path" not in volume
     assert got["paths_scanned"] == 0
+    assert got["complete"] is False
+    assert got["totals_are_lower_bounds"] is True
 
 
 def test_k3s_volume_usage_shares_scan_budget_fairly(
@@ -1071,6 +1436,9 @@ def test_k3s_volume_usage_shares_scan_budget_fairly(
     assert got["max_entries_per_volume"] == 3
     assert all(volume["usage"]["entries_scanned"] == 3 for volume in got["volumes"])
     assert all(volume["usage"]["truncated"] is True for volume in got["volumes"])
+    assert all(volume["usage_complete"] is False for volume in got["volumes"])
+    assert got["complete"] is False
+    assert got["totals_are_lower_bounds"] is True
 
 
 def test_k3s_volume_usage_keeps_fast_tools_responsive(
