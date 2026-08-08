@@ -33,6 +33,9 @@ commands:
     run: uv run node-stats-mcp
     description: Run the MCP server locally over streamable-HTTP on :8080.
 
+agent:
+  workflow: merge-remote-main
+
 catalog:
   kind: Component
   type: service
