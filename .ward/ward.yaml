@@ -37,11 +37,6 @@ agent:
   workflow: merge-remote-main
 
 catalog:
-  kind: Component
-  type: service
-  system: infrastructure
-  owner: kai
-  lifecycle: production
   description: "Node-local MCP battery that reads Linux contention plus k3s health, usage, scheduled work, and storage attribution. It serves streamable-HTTP tools and bounded OTLP metrics and logs. The deploy surface lives in coilyco-bridge/deploy."
   dependsOn: []
   providesApis:
