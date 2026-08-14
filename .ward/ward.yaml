@@ -33,9 +33,6 @@ commands:
     run: uv run node-stats-mcp
     description: Run the MCP server locally over streamable-HTTP on :8080.
 
-agent:
-  workflow: merge-remote-main
-
 catalog:
   description: "Node-local MCP battery that reads Linux contention plus k3s health, usage, scheduled work, and storage attribution. It serves streamable-HTTP tools and bounded OTLP metrics and logs. The deploy surface lives in coilyco-bridge/deploy."
   dependsOn: []
