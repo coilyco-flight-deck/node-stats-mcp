@@ -67,13 +67,13 @@ The two processes fail independently. Collector errors do not stop collection, a
 ## Run it locally
 
 ```sh
-ward sync
-ward run     # streamable-HTTP MCP on :8080, endpoint at /mcp
+just sync
+just run     # streamable-HTTP MCP on :8080, endpoint at /mcp
 ```
 
 ## Commands
 
-Dev commands are declared in [`.ward/ward.yaml`](.ward/ward.yaml). Run them as `ward <verb>`.
+Dev commands are declared in the [`justfile`](justfile). Run them as `just <verb>`.
 
 ## Image
 

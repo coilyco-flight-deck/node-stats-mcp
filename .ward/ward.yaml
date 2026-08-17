@@ -1,37 +1,9 @@
-# Per-repo command allowlist for node-stats-mcp (the `ward` gate).
+# Catalog metadata for the cross-repo knowledge graph.
 #
-# Deploy verbs are deliberately absent - the deploy surface lives in
-# coilyco-bridge/deploy/services/node-stats-mcp per the layer invariant
-# (source -> deploy).
-
-commands:
-  sync:
-    run: uv sync --group dev
-    description: uv lock + uv sync with dev deps.
-  test:
-    run: uv run pytest
-    description: Run the pytest suite.
-  lint:
-    run: bash scripts/ward-quality.sh check
-    description: ruff check + ruff format --check + mypy on src/ and tests/.
-  fmt:
-    run: bash scripts/ward-quality.sh format
-    description: Apply ruff fixes and formatting in place.
-  precommit:
-    run: uv run pre-commit run --all-files
-    description: Run all pre-commit hooks against every file.
-  build-docker:
-    run: docker build -t node-stats-mcp:local .
-    description: Build the node-stats-mcp docker image locally.
-  smoke-docker:
-    run: docker run --rm --entrypoint python node-stats-mcp:local -c "import node_stats_mcp.server"
-    description: Prove the built image can import the production server entrypoint.
-  check-publish:
-    run: bash -n scripts/publish-image.sh
-    description: Validate the trusted Forgejo OCI publisher shell contract.
-  run:
-    run: uv run node-stats-mcp
-    description: Run the MCP server locally over streamable-HTTP on :8080.
+# Dev verbs used to live here as a `commands:` block. They are recipes in the
+# justfile now. This file survives only because check_catalog_block pins this
+# exact path and catalog-trifecta wants README, AGENTS, and FEATURES to link
+# it, both upstream in agentic-os.
 
 catalog:
   description: "Node-local MCP battery that reads Linux contention plus k3s health, usage, scheduled work, and storage attribution. It serves streamable-HTTP tools and bounded OTLP metrics and logs. The deploy surface lives in coilyco-bridge/deploy."

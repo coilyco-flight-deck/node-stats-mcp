@@ -20,11 +20,11 @@ The deploy surface lives in [coilyco-bridge/deploy](https://forgejo.coilysiren.m
 
 ## Commands
 
-Route every command through Ward, never bare `uv` / `pytest`. Verbs are declared in [`.ward/ward.yaml`](.ward/ward.yaml). Run them as `ward exec <verb>`.
+Route every command through just, never bare `uv` / `pytest`. Verbs are declared in the [`justfile`](justfile). Run them as `just <verb>`.
 
 ## Validation
 
-`ward lint` (ruff + ruff-format + mypy) and `ward test` (pytest). `ward precommit` runs the full pre-commit suite, including the agentic-os catalog hooks. Validate before pushing.
+`just lint` (ruff + ruff-format + mypy) and `just test` (pytest). `just precommit` runs the full pre-commit suite, including the agentic-os catalog hooks. Validate before pushing.
 
 ## Safety
 
