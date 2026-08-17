@@ -11,7 +11,9 @@ blocks, and explicit completeness state. Callers never supply a raw path.
    normally returns `snapshot_status: pending` and starts a background scan.
 3. Poll the same profile until `refresh.running` is false.
 4. Follow the largest child through another configured profile. The defaults
-   provide `root`, `var`, `var-lib`, `k3s`, and `k3s-storage`.
+   provide `root`, `var`, `var-lib`, `k3s`, `k3s-storage`, and `pod-ephemeral`.
+   `pod-ephemeral` covers `emptyDir` and pod scratch under
+   `/var/lib/kubelet/pods`, which no other profile attributes.
 5. Trust a total only when `snapshot.complete` is true. Otherwise
    `totals_are_lower_bounds` is true and the response retains the cause.
 

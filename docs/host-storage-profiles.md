@@ -24,8 +24,9 @@ requiring `name` and absolute `path`, optionally `exclude_paths`,
 ```
 
 The built-in profiles are `root` (`/`), `var` (`/var`), `var-lib`
-(`/var/lib`), `k3s` (`/var/lib/rancher/k3s`), and `k3s-storage`
-(`/var/lib/rancher/k3s/storage`).
+(`/var/lib`), `k3s` (`/var/lib/rancher/k3s`), `k3s-storage`
+(`/var/lib/rancher/k3s/storage`), and `pod-ephemeral`
+(`/var/lib/kubelet/pods`).
 
 Global defaults for omitted profile fields are:
 

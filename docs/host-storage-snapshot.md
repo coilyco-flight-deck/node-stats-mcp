@@ -15,11 +15,18 @@ Each snapshot reports:
   errors, permission failures, duration, timeout, and truncation.
 * **Trust** - status, completeness, lower-bound state, capture time, age,
   stale threshold, and active refresh.
-* **Deduplication** - hard-linked file inodes count once. Other filesystems are
+* **Deduplication** - hard-linked file inodes count once, reported as
+  `deduplicated_entries` and `hardlinked_inodes_tracked`. Other filesystems are
   excluded. Same-filesystem bind or subtree mounts are reported and skipped.
 
 Kubelet PVC bind mounts therefore do not count data already present beneath
-the k3s local-path storage tree.
+the k3s local-path storage tree, and the `pod-ephemeral` profile measures only
+`emptyDir` and pod scratch.
+
+Only multiply-linked inodes enter the dedup set, so its size tracks hard links
+rather than the tree. Tracking every inode cost roughly 160 MB per million
+entries and killed the wide profiles at their configured budget
+(`node-stats-mcp#26`).
 
 `get_k3s_volume_usage` keeps its bounded Kubernetes join and fair per-volume
 scan. It labels every volume, namespace rollup, and overall result as complete
