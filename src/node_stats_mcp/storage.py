@@ -63,6 +63,7 @@ class UsageProfile:
     max_entries: int = 5_000_000
     timeout_seconds: float = 900.0
     max_children: int = 10_000
+    max_depth: int = 1
 
 
 @dataclass
@@ -231,6 +232,8 @@ def _scan_result(path: str) -> dict[str, Any]:
         "timed_out": False,
         "complete": True,
         "totals_are_lower_bounds": False,
+        "children": [],
+        "child_count": 0,
     }
 
 
@@ -386,6 +389,131 @@ def _scan_tree(
     return result
 
 
+def _mark_completeness(result: dict[str, Any]) -> dict[str, Any]:
+    result["complete"] = not (
+        result["truncated"] or result["permission_errors"] or result["scan_errors"]
+    )
+    result["totals_are_lower_bounds"] = not result["complete"]
+    return result
+
+
+def _absorb(parent: dict[str, Any], child: dict[str, Any]) -> None:
+    for key in (
+        "size_bytes",
+        "apparent_bytes",
+        "entries_scanned",
+        "deduplicated_entries",
+        "permission_errors",
+        "scan_errors",
+        "excluded_mount_count",
+    ):
+        parent[key] += int(child[key])
+    if child["truncated"]:
+        parent["truncated"] = True
+        parent["truncation_reason"] = parent["truncation_reason"] or child["truncation_reason"]
+    if child["timed_out"]:
+        parent["timed_out"] = True
+    for error in child["errors"]:
+        if len(parent["errors"]) < 10:
+            parent["errors"].append(error)
+
+
+def _scan_level(
+    rootfs: str | Path,
+    path: str,
+    budget: _Budget,
+    exclusions: dict[str, dict[str, Any]],
+    seen_inodes: set[int],
+) -> tuple[dict[str, Any], list[str]]:
+    """Account one directory plus its leaf entries, returning its subdirectories."""
+    result = _scan_result(_public_path(rootfs, path))
+    if path in exclusions:
+        result["excluded_mount_count"] = 1
+        return result, []
+    try:
+        node_stat = os.lstat(path)
+    except FileNotFoundError:
+        result["exists"] = False
+        return result, []
+    except PermissionError:
+        result["permission_errors"] = 1
+        return _mark_completeness(result), []
+    except OSError as exc:
+        _record_error(result, exc)
+        return _mark_completeness(result), []
+
+    result["size_bytes"] += _allocated_bytes(node_stat)
+    result["apparent_bytes"] += int(node_stat.st_size)
+    result["entries_scanned"] += 1
+    budget.entries_scanned += 1
+    if not stat.S_ISDIR(node_stat.st_mode):
+        return _mark_completeness(result), []
+
+    directories: list[str] = []
+    leaves: list[str] = []
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if reason := _stop_reason(budget):
+                    result["truncated"] = True
+                    result["truncation_reason"] = reason
+                    result["timed_out"] = reason == "timeout"
+                    break
+                try:
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    is_directory = False
+                (directories if is_directory else leaves).append(entry.path)
+    except PermissionError:
+        result["permission_errors"] += 1
+    except FileNotFoundError:
+        result["exists"] = False
+    except OSError as exc:
+        _record_error(result, exc)
+
+    for leaf in leaves:
+        _absorb(result, _scan_tree(rootfs, leaf, budget, exclusions, seen_inodes))
+    directories.sort()
+    return _mark_completeness(result), directories
+
+
+def _scan_node(
+    rootfs: str | Path,
+    path: str,
+    depth: int,
+    max_children: int,
+    budget: _Budget,
+    exclusions: dict[str, dict[str, Any]],
+    seen_inodes: set[int],
+) -> dict[str, Any]:
+    """Scan one subtree, reporting nested children for the top `depth` levels."""
+    if depth <= 1:
+        return _scan_tree(rootfs, path, budget, exclusions, seen_inodes)
+
+    result, directories = _scan_level(rootfs, path, budget, exclusions, seen_inodes)
+    reported = directories[: max(1, max_children)]
+    if len(reported) < len(directories):
+        result["truncated"] = True
+        result["truncation_reason"] = result["truncation_reason"] or "child_cap"
+    for directory in reported:
+        child = _scan_node(
+            rootfs,
+            directory,
+            depth - 1,
+            max_children,
+            budget,
+            exclusions,
+            seen_inodes,
+        )
+        _absorb(result, child)
+        result["children"].append(child)
+    for directory in directories[len(reported) :]:
+        _absorb(result, _scan_tree(rootfs, directory, budget, exclusions, seen_inodes))
+    result["children"].sort(key=lambda item: (-int(item["size_bytes"]), str(item["path"])))
+    result["child_count"] = len(result["children"])
+    return _mark_completeness(result)
+
+
 def scan_usage_profile(
     rootfs: str | Path,
     profile: UsageProfile,
@@ -488,7 +616,16 @@ def scan_usage_profile(
     children.sort()
     seen_inodes: set[int] = set()
     child_results = [
-        _scan_tree(rootfs, child, budget, exclusions, seen_inodes) for child in children
+        _scan_node(
+            rootfs,
+            child,
+            profile.max_depth,
+            profile.max_children,
+            budget,
+            exclusions,
+            seen_inodes,
+        )
+        for child in children
     ]
     child_results.sort(key=lambda item: (-int(item["size_bytes"]), str(item["path"])))
     permission_errors = sum(int(item["permission_errors"]) for item in child_results)
@@ -526,8 +663,21 @@ def scan_usage_profile(
             "max_entries": profile.max_entries,
             "timeout_seconds": profile.timeout_seconds,
             "max_children": profile.max_children,
+            "max_depth": profile.max_depth,
         },
     }
+
+
+def _clip_children(children: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
+    """Clip reported detail at every depth without touching the cached totals."""
+    clipped = []
+    for child in children[:cap]:
+        nested = child.get("children")
+        if isinstance(nested, list) and nested:
+            child = {**child, "children": _clip_children(nested, cap)}
+            child["child_results_truncated"] = len(nested) > cap
+        clipped.append(child)
+    return clipped
 
 
 class HostUsageSnapshots:
@@ -549,6 +699,7 @@ class HostUsageSnapshots:
                 "max_entries": profile.max_entries,
                 "timeout_seconds": profile.timeout_seconds,
                 "max_children": profile.max_children,
+                "max_depth": profile.max_depth,
             }
             for profile in self.profiles.values()
         ]
@@ -610,7 +761,7 @@ class HostUsageSnapshots:
             if isinstance(children, list):
                 snapshot["returned_child_count"] = min(len(children), cap)
                 snapshot["child_results_truncated"] = len(children) > cap
-                snapshot["children"] = children[:cap]
+                snapshot["children"] = _clip_children(children, cap)
         return {
             "profile": name,
             "configured_profiles": self.configured_profiles(),

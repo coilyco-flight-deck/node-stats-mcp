@@ -17,8 +17,12 @@ blocks, and explicit completeness state. Callers never supply a raw path.
 5. Trust a total only when `snapshot.complete` is true. Otherwise
    `totals_are_lower_bounds` is true and the response retains the cause.
 
-The result limit clips returned child detail only. It does not change cached
-totals.
+A profile with `max_depth` above 1 nests `children` inside `children`, so one
+call answers what used to take a `du` per level. `k3s-storage` ships at depth 3,
+which reaches a claim's `data/attachments` without entering the pod.
+
+The result limit clips returned child detail at every depth. It does not change
+cached totals.
 
 ## Snapshot contract
 

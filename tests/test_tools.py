@@ -556,6 +556,60 @@ def test_pod_ephemeral_profile_excludes_bind_mounted_pvcs(
     assert 200_000 <= snapshot["size_bytes"] < 800_000
 
 
+def test_host_usage_depth_reaches_nested_paths_without_changing_totals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    claim = tmp_path / "var" / "lib" / "rancher" / "k3s" / "storage" / "pvc-forgejo"
+    attachments = claim / "data" / "attachments"
+    lfs = claim / "data" / "lfs"
+    packages = claim / "packages"
+    for directory in (attachments, lfs, packages):
+        directory.mkdir(parents=True)
+    (attachments / "a.bin").write_bytes(b"x" * 400_000)
+    (lfs / "b.bin").write_bytes(b"x" * 100_000)
+    (packages / "c.bin").write_bytes(b"x" * 200_000)
+    (claim / "loose.bin").write_bytes(b"x" * 50_000)
+    _write_mountinfo(tmp_path)
+
+    def snapshot_for(depth: int) -> dict:
+        profiles = json.dumps(
+            [
+                {
+                    "name": "k3s-storage",
+                    "path": "/var/lib/rancher/k3s/storage",
+                    "max_entries": 1000,
+                    "timeout_seconds": 10,
+                    "max_depth": depth,
+                }
+            ]
+        )
+        server = _load(monkeypatch, str(tmp_path), "", host_usage_profiles=profiles)
+        return _wait_for_host_snapshot(server, "k3s-storage")["snapshot"]
+
+    flat = snapshot_for(1)
+    deep = snapshot_for(3)
+
+    # Depth changes reporting granularity only. If it moved a byte or an entry the
+    # two views of one tree would disagree, and neither could be trusted.
+    assert deep["size_bytes"] == flat["size_bytes"]
+    assert deep["apparent_bytes"] == flat["apparent_bytes"]
+    assert deep["entries_scanned"] == flat["entries_scanned"]
+    assert flat["children"][0]["children"] == []
+
+    claim_result = deep["children"][0]
+    by_path = {child["path"]: child for child in claim_result["children"]}
+    data = by_path["/var/lib/rancher/k3s/storage/pvc-forgejo/data"]
+    nested = {child["path"]: child for child in data["children"]}
+    base = "/var/lib/rancher/k3s/storage/pvc-forgejo/data"
+    # The split that used to need an attended `kubectl exec` into the pod (#26).
+    assert nested[f"{base}/attachments"]["size_bytes"] > nested[f"{base}/lfs"]["size_bytes"]
+    # A parent still owns its own inode plus its loose files, so it is never a
+    # bare sum of the children shown beneath it.
+    assert claim_result["size_bytes"] > sum(
+        int(child["size_bytes"]) for child in claim_result["children"]
+    )
+
+
 def test_host_usage_snapshot_tracks_only_hardlinked_inodes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
