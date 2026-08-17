@@ -1,113 +1,39 @@
 # node-stats-mcp features
 
-Living inventory of what ships from this repo. One image provides a FastMCP server on port 8080 at `/mcp` and an independently runnable OTLP exporter.
-
-## OTLP export
-
-- **Same-image sidecar** - `node-stats-exporter` runs independently from the MCP process, so collector or export failures cannot take down the tool surface.
-- **Fast and slow cadences** - contention, kubelet resource usage, node health and events, scheduled work, freshness, configured conditions, and root-filesystem pressure export every minute by default. Bounded local-volume attribution exports every 15 minutes by default.
-- **Stable metrics** - node, namespace, device, CronJob, configured check, configured resource, and PVC dimensions support dashboards and alerts without pod, container, process, event-object, or generated PV names.
-- **Detailed structured logs** - one OTLP log per source retains the bounded source snapshot. Oversized records become valid JSON truncation envelopes.
-- **Independent signals** - metrics and logs use separate OTLP/HTTP requests. One signal may fail without cancelling the other, and the next cycle continues.
-- **Payload bounds** - collection limits, point caps, per-log caps, total signal payload caps, and HTTP timeouts are server-owned configuration.
+Living inventory of what ships here: a read-only MCP server over host and k3s
+diagnostics, with an OTLP exporter.
 
 ## Tools
 
-- **get_cpu_info** - utilization, logical/physical core counts, per-core percentages, load average.
-- **get_memory_info** - virtual and swap memory (bytes + percent).
-- **get_disk_info** - per-partition usage and mount info, resolved under `ROOTFS`.
-- **get_filesystem_pressure** - root filesystem capacity, available bytes, inode pressure, and byte runway to warning/critical thresholds.
-- **get_node_pressure_stalls** - fixed Linux PSI, selected VM pressure, and bounded per-device block I/O counters.
-- **get_pressure_path_usage** - worker-thread one-level attribution beneath configured node-pressure roots such as logs, journald, kubelet, k3s, and containerd storage. Every discovered child receives a fair entry and time slice, preventing a large root or child from starving siblings. Per-child results include size, entries scanned, permission/scan errors, skipped different-filesystem entries, and timeout/truncation metadata.
-- **get_host_usage_breakdown** - background snapshots for fixed profiles. Mount identity, filesystem exclusions, bind-mount deduplication, allocated and apparent bytes, freshness, errors, and explicit complete-versus-lower-bound state support a root-to-owner drilldown without a raw path.
-- **get_host_log_usage** - allocated usage for fixed log and journald roots. Nested journald roots are excluded from parent scans and counted separately.
-- **get_deleted_open_files** - worker-thread `/proc` metadata summary that deduplicates open inodes and separates disk-backed reclaimable files from linked, memfd, tmpfs, device, container-overlay, and other non-disk entries. Filenames and file contents are not returned.
-- **get_network_info** - aggregate and per-interface I/O counters (node-wide under hostNetwork).
-- **get_top_processes** - top N by cpu or memory (node-wide under hostPID).
-- **get_k3s_pods** - read-only namespace/pod/container inventory from the k3s API.
-- **get_k3s_container_memory** - approximate per-container memory from metrics-server or host cgroups.
-- **get_k3s_process_attribution** - top host processes annotated with namespace/pod/container when cgroup metadata resolves.
-- **get_k3s_resource_usage** - worker-thread kubelet Summary API view of node, runtime filesystem, system-container, pod, container, volume, network, and ephemeral-storage usage.
-- **get_k3s_node_health** - worker-thread node conditions, taints, capacity, allocatable resources, and recent relevant or warning events.
-- **get_k3s_volume_usage** - worker-thread local-volume scan joined to namespaces, PVCs, PVs, pod/container mount paths, and storage lifecycle state. Namespace totals count each volume once, server-owned roots constrain every scan, fair per-volume budgets prevent starvation, and unowned root children remain visible as unattributed storage. Volume, namespace, and response totals label complete usage versus lower bounds, while a matching host-usage profile schedules or exposes the complete background snapshot.
-- **get_k3s_scheduled_work** - worker-thread Jobs and CronJobs with activity, failure, duration, and last-schedule or last-success timing.
-- **get_configured_freshness** - metadata-only freshness state for server-configured host success markers.
-- **get_k3s_configured_conditions** - normalized conditions from server-configured Kubernetes custom-resource types.
-- **get_system_snapshot** - one-shot overview: cpu, memory, load, boot time, uptime, logged-in users.
-- **stat_path** - size/mode/mtime/type for a path under the readable-root allowlist.
-- **read_text_head** - up to `max_bytes` (capped) of a text file under the allowlist.
+All read-only: 30 host and node tools in [host tools](tools-host.md) and 8
+cluster tools in [k3s tools](tools-k3s.md), covering CPU, memory, disk,
+filesystem and PSI pressure, usage attribution, deleted open files, network,
+processes, and the k3s pod, volume, scheduling, and health views.
 
-## Security envelope
+## OTLP export
 
-- **Read-only** - no tool mutates the host.
-- **Prefix-allowlisted file access** - `NODE_STATS_READABLE_ROOTS` (colon-separated, empty by default) gates `stat_path` / `read_text_head`. Paths resolve real (symlinks collapsed) and must sit under an allowed root. `NODE_STATS_MAX_READ_BYTES` caps read size.
-- **Fixed pressure scan paths** - `get_pressure_path_usage` only discovers immediate children beneath `NODE_STATS_PRESSURE_PATHS`, never a caller-supplied raw path. Nested configured paths are skipped when an ancestor already covers them. Root discovery, per-child traversal, total entries, and wall-clock time are capped.
-- **Fixed host usage profiles** - `get_host_usage_breakdown` accepts only a validated profile name from `NODE_STATS_HOST_USAGE_PROFILES`. Recursive scans run on daemon workers, snapshots identify complete totals versus lower bounds, and stale cache state triggers refresh without blocking the request.
-- **Mount-aware physical attribution** - host usage and log scans use Linux mountinfo to report filesystem source/type, exclude other filesystems, deduplicate bind or subtree mounts, and count hard-linked non-directory inodes once.
-- **Fixed log and proc scans** - log and journald roots come only from server configuration. Deleted-file collection walks bounded `/proc/<pid>/fd` metadata, returns no filename, and never opens target contents.
-- **Fixed Kubernetes volume roots** - `get_k3s_volume_usage` accepts no path argument. The server resolves PV paths beneath `NODE_STATS_K3S_VOLUME_ROOTS`, rejects paths outside those roots, and bounds both one-level orphan discovery and recursive usage scans.
-- **Server-selected Kubernetes targets** - kubelet usage selects the configured node or the API's only node. Custom-resource condition reads derive API paths from validated server configuration. Callers supply neither node names nor API targets.
-- **Server-selected freshness markers** - `get_configured_freshness` accepts no path argument, resolves configured absolute paths beneath `ROOTFS`, and returns metadata without reading marker content.
-- **Network-gated reach** - the endpoint is meant to sit behind the tailnet / node boundary, not public.
+A same-image `node-stats-exporter` sidecar runs independently of the MCP
+process, on fast and slow cadences, emitting stable metric dimensions and
+bounded structured logs over independent signals. See
+[OTLP export](otlp-export.md).
 
-## Configuration (env)
+## Security and configuration
 
-- `PORT` (default 8080), `HOST` (default 0.0.0.0).
-- `ROOTFS` (default `/`) - where the host root is mounted in the pod (`/host` in the deploy).
-- `NODE_STATS_READABLE_ROOTS` - colon-separated read allowlist, interpreted inside `ROOTFS`.
-- `NODE_STATS_MAX_READ_BYTES` (default 65536).
-- `NODE_STATS_KUBECONFIG` (default `/etc/rancher/k3s/k3s.yaml`, interpreted inside `ROOTFS`) - host kubeconfig used for the k3s inventory when present.
-- `NODE_STATS_K8S_TIMEOUT_SECONDS` (default 3) - timeout for Kubernetes API reads.
-- `NODE_STATS_K3S_NODE_NAME` - optional fixed node for node-health and kubelet-summary reads. A cluster with exactly one node needs no setting.
-- `NODE_STATS_K3S_CONDITION_RESOURCES` (default `[]`) - JSON list of fixed custom-resource descriptors. Each object supplies `name`, `group`, `version`, `resource`, and optional `namespace`.
-- `NODE_STATS_FRESHNESS_CHECKS` (default `[]`) - JSON list of fixed host-marker descriptors. Each object supplies `name`, absolute `path`, and positive `max_age_seconds`.
-- `NODE_STATS_K3S_VOLUME_ROOTS` (default `/var/lib/rancher/k3s/storage`) - colon-separated fixed roots that may contain local PV paths.
-- `NODE_STATS_MAX_K3S_VOLUME_PATHS` (default 1000) - cap on local PV and unattributed child paths considered by one volume-usage request.
-- `NODE_STATS_DISK_WARN_PERCENT` (default 80).
-- `NODE_STATS_DISK_CRITICAL_PERCENT` (default 85).
-- `NODE_STATS_PRESSURE_PATHS` - colon-separated fixed paths for pressure scans, interpreted inside `ROOTFS`.
-- `NODE_STATS_MAX_PRESSURE_CHILDREN_PER_ROOT` (default 1000) - one-level discovery cap for each configured pressure root.
-- `NODE_STATS_MAX_DU_ENTRIES` (default 200000) - per-child traversal cap for pressure scans.
-- `NODE_STATS_MAX_DU_TOTAL_ENTRIES` (default 200000) - shared traversal cap across all pressure children in one request.
-- `NODE_STATS_DU_TIMEOUT_SECONDS` (default 10) - wall-clock cap for one pressure request; timeout is returned as root and child metadata.
-- `NODE_STATS_HOST_USAGE_PROFILES` - JSON list of fixed usage profiles. Each object requires `name` and absolute `path`, with optional `exclude_paths`, `stale_after_seconds`, `max_entries`, `timeout_seconds`, and `max_children`.
-- `NODE_STATS_HOST_USAGE_MAX_ENTRIES` (default 5000000) - background snapshot entry cap when a profile does not override it.
-- `NODE_STATS_HOST_USAGE_TIMEOUT_SECONDS` (default 900) - background snapshot wall-clock cap when a profile does not override it.
-- `NODE_STATS_HOST_USAGE_MAX_CHILDREN` (default 10000) - immediate-child discovery cap when a profile does not override it.
-- `NODE_STATS_HOST_USAGE_STALE_SECONDS` (default 900) - cached snapshot freshness window when a profile does not override it.
-- `NODE_STATS_HOST_LOG_PATHS` (default `/var/log`) - colon-separated fixed log roots.
-- `NODE_STATS_JOURNAL_PATHS` (default `/var/log/journal:/run/log/journal`) - colon-separated fixed journald roots.
-- `NODE_STATS_MAX_HOST_LOG_ENTRIES` (default 500000) - shared entry cap for one host-log request.
-- `NODE_STATS_HOST_LOG_TIMEOUT_SECONDS` (default 30) - wall-clock cap for one host-log request.
-- `NODE_STATS_MAX_HOST_LOG_CHILDREN` (default 1000) - immediate-child cap for each log or journald root.
-- `NODE_STATS_MAX_DELETED_FILE_PIDS` (default 4096) - process cap for one deleted-file request.
-- `NODE_STATS_MAX_DELETED_FILE_FDS_PER_PROCESS` (default 4096) - descriptor cap per process.
-- `NODE_STATS_DELETED_FILE_TIMEOUT_SECONDS` (default 10) - wall-clock cap for one deleted-file request.
-- `NODE_STATS_OTLP_ENDPOINT` - collector base URL or OTLP signal URL. The exporter normalizes it to `/v1/metrics` and `/v1/logs`.
-- `NODE_STATS_EXPORT_INTERVAL_SECONDS` (default 60, bounded 15 to 3600).
-- `NODE_STATS_EXPORT_VOLUME_INTERVAL_SECONDS` (default 900, bounded to at least the fast interval and at most 86400).
-- `NODE_STATS_EXPORT_LIMIT` (default 50, bounded 1 to 100) - shared source result limit.
-- `NODE_STATS_EXPORT_MAX_LOG_BYTES` (default 262144, bounded 2048 to 1048576 and never above the payload cap).
-- `NODE_STATS_EXPORT_MAX_PAYLOAD_BYTES` (default 1048576, bounded 65536 to 4194304) - independent cap for each metrics or logs request.
-- `NODE_STATS_EXPORT_MAX_METRIC_POINTS` (default 2000, bounded 100 to 5000).
-- `NODE_STATS_OTLP_TIMEOUT_SECONDS` (default 5, bounded 1 to 30).
+Read-only by construction, an allowlisted read surface, and bounded traversal:
+[security](security.md). Settings are environment-only, in
+[configuration](configuration.md) and
+[scan configuration](configuration-scans.md).
 
 ## Deploy
 
-Node-pinned hostPID + hostNetwork pod. A trusted main-only workflow publishes
-the private single-architecture image as
-`forgejo.coilysiren.me/coilyco-flight-deck/node-stats-mcp:<full-source-sha>`
-with the package-write credential and verifies the remote manifest. Rollout
-lives in [coilyco-bridge/deploy](https://forgejo.coilysiren.me/coilyco-bridge/deploy)
-`services/node-stats-mcp`, which receives only the package-read credential.
+Every push to canonical `main` publishes and verifies the private image at a
+full source SHA. Rollout lives in
+[deploy](https://forgejo.coilysiren.me/coilyco-bridge/deploy).
 
 ## See also
 
 - [../README.md](../README.md) - human-facing intro.
 - [../AGENTS.md](../AGENTS.md) - agent operating context.
-- [k3s-inventory.md](k3s-inventory.md) - k3s pod, container, and attribution walkthrough.
-- [signoz-export.md](signoz-export.md) - OTLP data model, bounds, and sidecar operation.
-- [host-storage.md](host-storage.md) - operator workflow and trust semantics for physical storage attribution.
 - [../.ward/ward.yaml](../.ward/ward.yaml) - allowlisted commands + catalog block.
 
 Cross-reference convention from [features-release-tooling.md](features-release-tooling.md).

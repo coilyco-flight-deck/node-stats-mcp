@@ -1,0 +1,19 @@
+# Host and node tools
+
+Every tool is read-only. The k3s tools are in [k3s tools](tools-k3s.md).
+
+- **get_cpu_info** - utilization, logical/physical core counts, per-core percentages, load average.
+- **get_memory_info** - virtual and swap memory (bytes + percent).
+- **get_disk_info** - per-partition usage and mount info, resolved under `ROOTFS`.
+- **get_filesystem_pressure** - root filesystem capacity, available bytes, inode pressure, and byte runway to warning/critical thresholds.
+- **get_node_pressure_stalls** - fixed Linux PSI, selected VM pressure, and bounded per-device block I/O counters.
+- **get_pressure_path_usage** - worker-thread one-level attribution beneath configured node-pressure roots such as logs, journald, kubelet, k3s, and containerd storage. Every discovered child receives a fair entry and time slice, preventing a large root or child from starving siblings. Per-child results include size, entries scanned, permission/scan errors, skipped different-filesystem entries, and timeout/truncation metadata.
+- **get_host_usage_breakdown** - background snapshots for fixed profiles. Mount identity, filesystem exclusions, bind-mount deduplication, allocated and apparent bytes, freshness, errors, and explicit complete-versus-lower-bound state support a root-to-owner drilldown without a raw path.
+- **get_host_log_usage** - allocated usage for fixed log and journald roots. Nested journald roots are excluded from parent scans and counted separately.
+- **get_deleted_open_files** - worker-thread `/proc` metadata summary that deduplicates open inodes and separates disk-backed reclaimable files from linked, memfd, tmpfs, device, container-overlay, and other non-disk entries. Filenames and file contents are not returned.
+- **get_network_info** - aggregate and per-interface I/O counters (node-wide under hostNetwork).
+- **get_top_processes** - top N by cpu or memory (node-wide under hostPID).
+- **get_configured_freshness** - metadata-only freshness state for server-configured host success markers.
+- **get_system_snapshot** - one-shot overview: cpu, memory, load, boot time, uptime, logged-in users.
+- **stat_path** - size/mode/mtime/type for a path under the readable-root allowlist.
+- **read_text_head** - up to `max_bytes` (capped) of a text file under the allowlist.
