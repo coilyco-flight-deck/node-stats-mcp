@@ -104,13 +104,19 @@ _HOST_USAGE_MAX_ENTRIES = int(os.environ.get("NODE_STATS_HOST_USAGE_MAX_ENTRIES"
 _HOST_USAGE_TIMEOUT_SECONDS = float(os.environ.get("NODE_STATS_HOST_USAGE_TIMEOUT_SECONDS", "900"))
 _HOST_USAGE_MAX_CHILDREN = int(os.environ.get("NODE_STATS_HOST_USAGE_MAX_CHILDREN", "10000"))
 _HOST_USAGE_STALE_SECONDS = int(os.environ.get("NODE_STATS_HOST_USAGE_STALE_SECONDS", "900"))
+_HOST_USAGE_MAX_DEPTH = int(os.environ.get("NODE_STATS_HOST_USAGE_MAX_DEPTH", "1"))
+# Depth changes reporting granularity, not the walk, but each level multiplies the
+# response, so the ceiling is fixed here rather than left to profile config.
+_MAX_HOST_USAGE_DEPTH = 5
 _DEFAULT_HOST_USAGE_PROFILES = (
     {"name": "root", "path": "/"},
     {"name": "var", "path": "/var"},
     {"name": "var-lib", "path": "/var/lib"},
     {"name": "k3s", "path": "/var/lib/rancher/k3s"},
-    {"name": "k3s-storage", "path": "/var/lib/rancher/k3s/storage"},
-    {"name": "pod-ephemeral", "path": "/var/lib/kubelet/pods"},
+    # Depth 3 reaches claim -> data -> attachments, so Forgejo's managed-asset
+    # split no longer needs an attended `kubectl exec` into the pod.
+    {"name": "k3s-storage", "path": "/var/lib/rancher/k3s/storage", "max_depth": 3},
+    {"name": "pod-ephemeral", "path": "/var/lib/kubelet/pods", "max_depth": 3},
 )
 
 _HOST_LOG_PATHS = tuple(
@@ -1059,6 +1065,10 @@ def _host_usage_profiles() -> tuple[list[storage.UsageProfile], list[str]]:
             errors,
             name,
         )
+        max_depth = min(
+            _MAX_HOST_USAGE_DEPTH,
+            int(_positive_number(config, "max_depth", _HOST_USAGE_MAX_DEPTH, errors, name)),
+        )
         profiles.append(
             storage.UsageProfile(
                 name=name,
@@ -1068,6 +1078,7 @@ def _host_usage_profiles() -> tuple[list[storage.UsageProfile], list[str]]:
                 max_entries=int(max_entries),
                 timeout_seconds=float(timeout),
                 max_children=int(max_children),
+                max_depth=max_depth,
             )
         )
         names.add(name)

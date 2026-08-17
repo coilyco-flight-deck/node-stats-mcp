@@ -8,7 +8,8 @@ root or child cannot starve its siblings or outlive a request.
 - `NODE_STATS_MAX_DU_ENTRIES` (default 200000) - per-child traversal cap for pressure scans.
 - `NODE_STATS_MAX_DU_TOTAL_ENTRIES` (default 200000) - shared traversal cap across all pressure children in one request.
 - `NODE_STATS_DU_TIMEOUT_SECONDS` (default 10) - wall-clock cap for one pressure request; timeout is returned as root and child metadata.
-- `NODE_STATS_HOST_USAGE_PROFILES` - JSON list of fixed usage profiles. Each object requires `name` and absolute `path`, with optional `exclude_paths`, `stale_after_seconds`, `max_entries`, `timeout_seconds`, and `max_children`.
+- `NODE_STATS_HOST_USAGE_PROFILES` - JSON list of fixed usage profiles. Each object requires `name` and absolute `path`, with optional `exclude_paths`, `stale_after_seconds`, `max_entries`, `timeout_seconds`, `max_children`, and `max_depth`.
+- `NODE_STATS_HOST_USAGE_MAX_DEPTH` (default 1) - reported nesting levels when a profile does not override it. Hard ceiling 5. Depth changes reporting granularity, not the walk.
 - `NODE_STATS_HOST_USAGE_MAX_ENTRIES` (default 5000000) - background snapshot entry cap when a profile does not override it.
 - `NODE_STATS_HOST_USAGE_TIMEOUT_SECONDS` (default 900) - background snapshot wall-clock cap when a profile does not override it.
 - `NODE_STATS_HOST_USAGE_MAX_CHILDREN` (default 10000) - immediate-child discovery cap when a profile does not override it.
