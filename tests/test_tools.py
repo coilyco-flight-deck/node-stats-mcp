@@ -524,6 +524,65 @@ def test_host_usage_snapshot_deduplicates_bind_mounts(
     assert children["rancher"]["size_bytes"] > children["kubelet"]["size_bytes"]
 
 
+def test_pod_ephemeral_profile_excludes_bind_mounted_pvcs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pod = tmp_path / "var" / "lib" / "kubelet" / "pods" / "pod-uid"
+    scratch = pod / "volumes" / "kubernetes.io~empty-dir" / "cache"
+    claim = pod / "volumes" / "kubernetes.io~local-volume" / "pvc-abc"
+    scratch.mkdir(parents=True)
+    claim.mkdir(parents=True)
+    (scratch / "scratch.bin").write_bytes(b"x" * 200_000)
+    (claim / "durable.bin").write_bytes(b"x" * 800_000)
+    device_id = _write_mountinfo(tmp_path)
+    claim_mountpoint = "/var/lib/kubelet/pods/pod-uid/volumes/kubernetes.io~local-volume/pvc-abc"
+    mountinfo = tmp_path / "proc" / "self" / "mountinfo"
+    mountinfo.write_text(
+        mountinfo.read_text()
+        + (
+            f"2 1 {device_id} /var/lib/rancher/k3s/storage/pvc-abc "
+            f"{claim_mountpoint} rw,relatime - ext4 /dev/root rw\n"
+        )
+    )
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    snapshot = _wait_for_host_snapshot(server, "pod-ephemeral")["snapshot"]
+    excluded = {item["path"]: item for item in snapshot["excluded_mounts"]}
+
+    assert snapshot["path"] == "/var/lib/kubelet/pods"
+    # The claim bytes belong to k3s-storage. Counting them here too would make
+    # the domains sum past the filesystem (node-stats-mcp#26).
+    assert excluded[claim_mountpoint]["deduplicated"] is True
+    assert 200_000 <= snapshot["size_bytes"] < 800_000
+
+
+def test_host_usage_snapshot_tracks_only_hardlinked_inodes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tree = tmp_path / "var" / "lib" / "content"
+    tree.mkdir(parents=True)
+    for index in range(64):
+        (tree / f"single-{index}.bin").write_bytes(b"x" * 1024)
+    original = tree / "blob.bin"
+    original.write_bytes(b"x" * 4096)
+    os.link(original, tree / "blob.link")
+    _write_mountinfo(tmp_path)
+    profiles = json.dumps(
+        [{"name": "var-lib", "path": "/var/lib", "max_entries": 1000, "timeout_seconds": 10}]
+    )
+    server = _load(monkeypatch, str(tmp_path), "", host_usage_profiles=profiles)
+
+    snapshot = _wait_for_host_snapshot(server, "var-lib")["snapshot"]
+
+    assert snapshot["complete"] is True
+    assert snapshot["entries_scanned"] > 64
+    # The dedup set must stay proportional to hardlinks, not to the tree, or a
+    # wide profile OOMs the container before it finishes (node-stats-mcp#26).
+    assert snapshot["hardlinked_inodes_tracked"] == 1
+    assert snapshot["deduplicated_entries"] == 1
+    assert snapshot["size_bytes"] == sum(int(child["size_bytes"]) for child in snapshot["children"])
+
+
 def test_host_usage_snapshot_marks_entry_cap_as_lower_bound(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

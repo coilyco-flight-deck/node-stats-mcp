@@ -110,6 +110,7 @@ _DEFAULT_HOST_USAGE_PROFILES = (
     {"name": "var-lib", "path": "/var/lib"},
     {"name": "k3s", "path": "/var/lib/rancher/k3s"},
     {"name": "k3s-storage", "path": "/var/lib/rancher/k3s/storage"},
+    {"name": "pod-ephemeral", "path": "/var/lib/kubelet/pods"},
 )
 
 _HOST_LOG_PATHS = tuple(

@@ -96,9 +96,9 @@ def _rooted(rootfs: str | Path, public_path: str) -> Path:
     return root.joinpath(public_path.lstrip("/"))
 
 
-def _public_path(rootfs: str | Path, actual_path: Path) -> str:
+def _public_path(rootfs: str | Path, actual_path: str | Path) -> str:
     try:
-        relative = actual_path.relative_to(Path(rootfs))
+        relative = Path(actual_path).relative_to(Path(rootfs))
     except ValueError:
         return _normalize_public_path(str(actual_path))
     if str(relative) in {"", "."}:
@@ -296,18 +296,23 @@ def _mount_exclusions(
 def _actual_exclusions(
     rootfs: str | Path,
     public_exclusions: dict[Path, dict[str, Any]],
-) -> dict[Path, dict[str, Any]]:
+) -> dict[str, dict[str, Any]]:
     return {
-        _rooted(rootfs, str(public_path)): item for public_path, item in public_exclusions.items()
+        str(_rooted(rootfs, str(public_path))): item
+        for public_path, item in public_exclusions.items()
     }
+
+
+def _inode_key(path_stat: os.stat_result) -> int:
+    return (int(path_stat.st_dev) << 64) | int(path_stat.st_ino)
 
 
 def _scan_tree(
     rootfs: str | Path,
-    path: Path,
+    path: str,
     budget: _Budget,
-    exclusions: dict[Path, dict[str, Any]],
-    seen_inodes: set[tuple[int, int]],
+    exclusions: dict[str, dict[str, Any]],
+    seen_inodes: set[int],
 ) -> dict[str, Any]:
     public = _public_path(rootfs, path)
     result = _scan_result(public)
@@ -323,7 +328,7 @@ def _scan_tree(
             result["excluded_mount_count"] += 1
             continue
         try:
-            current_stat = current.lstat()
+            current_stat = os.lstat(current)
         except FileNotFoundError:
             continue
         except PermissionError:
@@ -334,11 +339,15 @@ def _scan_tree(
             continue
 
         is_directory = stat.S_ISDIR(current_stat.st_mode)
-        inode_key = (int(current_stat.st_dev), int(current_stat.st_ino))
-        if not is_directory and inode_key in seen_inodes:
-            result["deduplicated_entries"] += 1
-            continue
-        if not is_directory:
+        # Only a multiply-linked file can be reached twice, so tracking the
+        # single-link majority would grow with the tree and never deduplicate
+        # anything. Mount-level duplicates are already excluded upstream, and du
+        # draws this same line.
+        if not is_directory and current_stat.st_nlink > 1:
+            inode_key = _inode_key(current_stat)
+            if inode_key in seen_inodes:
+                result["deduplicated_entries"] += 1
+                continue
             seen_inodes.add(inode_key)
 
         result["size_bytes"] += _allocated_bytes(current_stat)
@@ -362,7 +371,7 @@ def _scan_tree(
                         result["truncated"] = True
                         result["truncation_reason"] = "entry_cap"
                         break
-                    stack.append(Path(entry.path))
+                    stack.append(entry.path)
         except PermissionError:
             result["permission_errors"] += 1
         except FileNotFoundError:
@@ -408,6 +417,8 @@ def scan_usage_profile(
             "size_bytes": 0,
             "apparent_bytes": 0,
             "entries_scanned": 0,
+            "hardlinked_inodes_tracked": 0,
+            "deduplicated_entries": 0,
             "permission_errors": 0,
             "scan_errors": 0,
             "timed_out": False,
@@ -458,7 +469,7 @@ def scan_usage_profile(
             time.monotonic() + profile.timeout_seconds if profile.timeout_seconds > 0 else None
         ),
     )
-    children: list[Path] = []
+    children: list[str] = []
     discovery_truncated = False
     discovery_timed_out = False
     try:
@@ -471,11 +482,11 @@ def scan_usage_profile(
                 if len(children) >= max(1, profile.max_children):
                     discovery_truncated = True
                     break
-                children.append(Path(entry.path))
+                children.append(entry.path)
     except OSError as exc:
         errors.append(f"{type(exc).__name__}: {exc}")
-    children.sort(key=str)
-    seen_inodes: set[tuple[int, int]] = set()
+    children.sort()
+    seen_inodes: set[int] = set()
     child_results = [
         _scan_tree(rootfs, child, budget, exclusions, seen_inodes) for child in children
     ]
@@ -501,6 +512,8 @@ def scan_usage_profile(
         "size_bytes": sum(int(item["size_bytes"]) for item in child_results),
         "apparent_bytes": sum(int(item["apparent_bytes"]) for item in child_results),
         "entries_scanned": budget.entries_scanned,
+        "hardlinked_inodes_tracked": len(seen_inodes),
+        "deduplicated_entries": sum(int(item["deduplicated_entries"]) for item in child_results),
         "permission_errors": permission_errors,
         "scan_errors": scan_errors,
         "timed_out": discovery_timed_out or any(bool(item["timed_out"]) for item in child_results),
