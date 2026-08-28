@@ -63,4 +63,12 @@ org = "coilyco-flight-deck"
 enabled = true
 
 [tool.agentic-os.documentation-layout]
-band = "small"
+# Large, not small. `small` was stamped fleet-wide by the agentic-os#1108
+# sweep rather than chosen, and its per-file cap is half the pre-band flat cap,
+# so advancing the pin makes previously-legal content illegal. See inbox#439.
+band = "large"
+
+# The managed markers are stamped inside the pre-commit YAML and
+# cannot form a single top-of-file comment block.
+[tool.agentic-os.code-comments]
+excludes = [".pre-commit-config.yaml"]

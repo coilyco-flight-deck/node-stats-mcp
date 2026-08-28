@@ -28,4 +28,3 @@ cached totals.
 
 What a snapshot promises and when it is a lower bound:
 [snapshot contract](host-storage-snapshot.md).
-

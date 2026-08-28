@@ -46,10 +46,8 @@ from node_stats_mcp import storage
 # /host and sets ROOTFS=/host. Bare local runs leave it at / (the real root).
 ROOTFS = os.environ.get("ROOTFS", "/")
 
-# Colon-separated prefixes the file tools may read under, resolved against the
-# real (symlink-collapsed) path. Empty = file reads are denied. The prefixes are
-# interpreted inside ROOTFS, e.g. "/etc:/var/log" with ROOTFS=/host permits
-# /host/etc and /host/var/log only.
+# Read prefixes, resolved against the symlink-collapsed path and interpreted
+# inside ROOTFS. Empty denies every file read. See docs/security.md.
 _READABLE_ROOTS = [r for r in os.environ.get("NODE_STATS_READABLE_ROOTS", "").split(":") if r]
 
 # Hard cap on read_text_head so a tool call can never stream a huge file.
@@ -2698,9 +2696,8 @@ def read_text_head(path: str, max_bytes: int = _MAX_READ_BYTES) -> dict[str, Any
     }
 
 
-# Register each tool without rebinding its name, so the plain callables stay
-# directly invokable. Tests call them, and the mcp SDK's decorator return type has
-# varied across versions, so we don't rely on it).
+# Register without rebinding the name, so the plain callables stay directly
+# invocable: the SDK's decorator return type has varied across versions.
 for _tool in (
     get_cpu_info,
     get_memory_info,

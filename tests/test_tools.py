@@ -1,7 +1,7 @@
 """Behavioural tests for the node-stats tools.
 
 The tools are registered with FastMCP without rebinding their names, so the
-plain callables stay directly invokable here. The focus is the security
+plain callables stay directly invocable here. The focus is the security
 envelope: file reads are denied unless a root is allowlisted, and the allowlist
 cannot be escaped.
 """

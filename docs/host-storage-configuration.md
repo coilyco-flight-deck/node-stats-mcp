@@ -7,4 +7,3 @@ profiles, root escapes, and exclusions outside a profile are rejected.
 
 Profile shape, defaults, and the fields each accepts:
 [usage profiles](host-storage-profiles.md).
-

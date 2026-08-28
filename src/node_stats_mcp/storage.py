@@ -343,9 +343,7 @@ def _scan_tree(
 
         is_directory = stat.S_ISDIR(current_stat.st_mode)
         # Only a multiply-linked file can be reached twice, so tracking the
-        # single-link majority would grow with the tree and never deduplicate
-        # anything. Mount-level duplicates are already excluded upstream, and du
-        # draws this same line.
+        # single-link majority would grow with the tree and never dedupe. du agrees.
         if not is_directory and current_stat.st_nlink > 1:
             inode_key = _inode_key(current_stat)
             if inode_key in seen_inodes:
