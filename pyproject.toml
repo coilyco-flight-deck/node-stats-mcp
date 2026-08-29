@@ -5,7 +5,7 @@ description = "Node-local MCP battery with streamable-HTTP tools and bounded OTL
 readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "MIT" }
-authors = [{ name = "Kai Siren" }]
+authors = [{ name = "Kai Ase Siren" }]
 dependencies = [
   "mcp>=1.14.0",
   "psutil>=6.0.0",
