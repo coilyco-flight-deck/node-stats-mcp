@@ -11,7 +11,9 @@ Every tool is read-only. The k3s tools are in [k3s tools](tools-k3s.md).
 - **get_host_usage_breakdown** - background snapshots for fixed profiles. Mount identity, filesystem exclusions, bind-mount deduplication, allocated and apparent bytes, freshness, errors, and explicit complete-versus-lower-bound state support a root-to-owner drilldown without a raw path.
 - **get_host_log_usage** - allocated usage for fixed log and journald roots. Nested journald roots are excluded from parent scans and counted separately.
 - **get_deleted_open_files** - worker-thread `/proc` metadata summary that deduplicates open inodes and separates disk-backed reclaimable files from linked, memfd, tmpfs, device, container-overlay, and other non-disk entries. Filenames and file contents are not returned.
-- **get_network_info** - aggregate and per-interface I/O counters (node-wide under hostNetwork).
+- **get_network_info** - aggregate and per-interface I/O counters, filtered to drop per-pod veth churn (node-wide under hostNetwork). See [networking tools](tools-network.md).
+- **get_conntrack** - netfilter connection tracking count against max, plus every per-CPU error column the kernel publishes, summed by name. See [networking tools](tools-network.md).
+- **get_socket_states** - TCP socket counts by state and ephemeral port usage against the configured range. See [networking tools](tools-network.md).
 - **get_top_processes** - top N by cpu or memory (node-wide under hostPID).
 - **get_configured_freshness** - metadata-only freshness state for server-configured host success markers.
 - **get_system_snapshot** - one-shot overview: cpu, memory, load, boot time, uptime, logged-in users.

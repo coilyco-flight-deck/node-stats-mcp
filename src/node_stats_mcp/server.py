@@ -58,6 +58,21 @@ _K3S_NODE_NAME = os.environ.get("NODE_STATS_K3S_NODE_NAME")
 _FRESHNESS_CHECKS_JSON = os.environ.get("NODE_STATS_FRESHNESS_CHECKS", "[]")
 _K3S_CONDITION_RESOURCES_JSON = os.environ.get("NODE_STATS_K3S_CONDITION_RESOURCES", "[]")
 _DEFAULT_K3S_VOLUME_ROOTS = ("/var/lib/rancher/k3s/storage",)
+
+# Networking sources. All procfs, so no conntrack binary and no new dependency.
+_CONNTRACK_COUNT_PATH = "/proc/sys/net/netfilter/nf_conntrack_count"
+_CONNTRACK_MAX_PATH = "/proc/sys/net/netfilter/nf_conntrack_max"
+_CONNTRACK_STAT_PATH = "/proc/net/stat/nf_conntrack"
+_EPHEMERAL_RANGE_PATH = "/proc/sys/net/ipv4/ip_local_port_range"
+# One veth per pod is the bulk of a k3s node's interface list and none of them
+# are what an incident asks about. Overridable per deployment.
+_VIRTUAL_INTERFACE_PREFIXES = tuple(
+    prefix
+    for prefix in os.environ.get(
+        "NODE_STATS_VIRTUAL_INTERFACE_PREFIXES", "veth:cali:lxc:docker:br-"
+    ).split(":")
+    if prefix
+)
 _K3S_VOLUME_ROOTS = tuple(
     path
     for path in os.environ.get(
@@ -2628,17 +2643,200 @@ async def get_deleted_open_files(limit: int = 20) -> dict[str, Any]:
     )
 
 
-def get_network_info() -> dict[str, Any]:
+def get_network_info(interfaces: str = "default") -> dict[str, Any]:
     """Aggregate and per-interface network I/O counters for this node.
+
+    `interfaces` takes "default" (drops per-pod veth churn), "all", or a
+    comma-separated list such as "enp1s0,cni0,flannel.1,tailscale0". What was
+    filtered is always reported, never silently dropped.
+
+    These are LIFETIME counters. A non-zero drop count says nothing on its own,
+    because the node's uptime is days: only movement between two readings is
+    interpretable. See docs/tools-network.md.
 
     Reflects the node only when the pod runs with hostNetwork. Otherwise these
     are the pod's own interface counters.
     """
+    per_nic = {name: c._asdict() for name, c in psutil.net_io_counters(pernic=True).items()}
+    selected, filtering = _select_interfaces(per_nic, interfaces)
     return {
         "total": psutil.net_io_counters()._asdict(),
-        "per_interface": {
-            name: c._asdict() for name, c in psutil.net_io_counters(pernic=True).items()
-        },
+        "per_interface": selected,
+        "filtering": filtering,
+        "counter_semantics": "cumulative since boot",
+    }
+
+
+def get_conntrack() -> dict[str, Any]:
+    """Netfilter connection tracking: count against max, and the per-CPU error totals.
+
+    Read from procfs rather than the conntrack binary, so this adds no
+    dependency. `totals` carries every column the running kernel publishes,
+    summed across CPUs and parsed by column name, with insert_failed, drop and
+    early_drop being the ones an egress fault turns up in.
+
+    These are LIFETIME counters and only their movement is interpretable.
+    Needs the host /proc mount and hostNetwork to describe the node.
+    """
+    return _conntrack()
+
+
+def get_socket_states() -> dict[str, Any]:
+    """TCP socket counts by state, and ephemeral port usage against the configured range.
+
+    Ephemeral exhaustion presents exactly like an upstream outage: new
+    connections are refused while established ones keep working. The
+    `ephemeral.utilization` figure is what separates the two.
+
+    Needs hostNetwork to describe the node rather than the pod.
+    """
+    return _socket_states()
+
+
+def _parse_conntrack_stat(text: str) -> tuple[dict[str, int], int]:
+    """Sum the per-CPU rows of /proc/net/stat/nf_conntrack by column NAME.
+
+    The file's first line is its own header, and the column set differs across
+    kernel versions. Indexing by position works on the kernel it was written
+    against and returns confident nonsense on any other, so the header is what
+    is read here. Unknown columns are summed too rather than dropped, since a
+    newer kernel's extra counter is still a counter.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return {}, 0
+    columns = lines[0].split()
+    totals: dict[str, int] = dict.fromkeys(columns, 0)
+    cpus = 0
+    for line in lines[1:]:
+        values = line.split()
+        if len(values) != len(columns):
+            continue
+        cpus += 1
+        for name, raw in zip(columns, values, strict=True):
+            try:
+                totals[name] += int(raw, 16)
+            except ValueError:
+                continue
+    return totals, cpus
+
+
+def _read_host_int(path: str) -> int | None:
+    text = _read_host_text(path)
+    if text is None:
+        return None
+    try:
+        return int(text.strip())
+    except ValueError:
+        return None
+
+
+def _conntrack() -> dict[str, Any]:
+    count = _read_host_int(_CONNTRACK_COUNT_PATH)
+    maximum = _read_host_int(_CONNTRACK_MAX_PATH)
+    stat_text = _read_host_text(_CONNTRACK_STAT_PATH)
+    totals, cpus = _parse_conntrack_stat(stat_text or "")
+
+    notes: list[str] = []
+    if count is None and maximum is None and not totals:
+        notes.append(
+            "nf_conntrack is not readable here. The module may be unloaded, or the "
+            "pod may lack the host /proc mount and hostNetwork."
+        )
+    utilization = None
+    if count is not None and maximum:
+        utilization = round(count / maximum, 4)
+    return {
+        "count": count,
+        "max": maximum,
+        "utilization": utilization,
+        "cpus": cpus,
+        # Summed across CPUs. Only movement is interpretable. See
+        # docs/tools-network.md.
+        "totals": totals,
+        "notes": notes,
+    }
+
+
+def _ephemeral_port_range() -> dict[str, Any]:
+    text = _read_host_text(_EPHEMERAL_RANGE_PATH)
+    parts = (text or "").split()
+    if len(parts) != 2:
+        return {"low": None, "high": None, "size": None}
+    try:
+        low, high = int(parts[0]), int(parts[1])
+    except ValueError:
+        return {"low": None, "high": None, "size": None}
+    return {"low": low, "high": high, "size": max(0, high - low + 1)}
+
+
+def _socket_states() -> dict[str, Any]:
+    ephemeral = _ephemeral_port_range()
+    states: dict[str, int] = {}
+    local_ports: set[int] = set()
+    notes: list[str] = []
+    try:
+        connections = psutil.net_connections(kind="tcp")
+    except (psutil.AccessDenied, PermissionError):
+        return {
+            "states": {},
+            "total": 0,
+            "ephemeral": ephemeral,
+            "notes": [
+                "Reading socket state was denied. This needs the pod to run with "
+                "hostNetwork and sufficient privilege to read /proc/net/tcp."
+            ],
+        }
+    low, high = ephemeral["low"], ephemeral["high"]
+    for conn in connections:
+        states[conn.status] = states.get(conn.status, 0) + 1
+        if conn.laddr and low is not None and high is not None:
+            port = conn.laddr[1] if isinstance(conn.laddr, tuple) else conn.laddr.port
+            if low <= port <= high:
+                local_ports.add(port)
+    if low is not None and ephemeral["size"]:
+        ephemeral = {
+            **ephemeral,
+            "in_use": len(local_ports),
+            "utilization": round(len(local_ports) / ephemeral["size"], 4),
+        }
+    return {
+        "states": dict(sorted(states.items())),
+        "total": len(connections),
+        "ephemeral": ephemeral,
+        "notes": notes,
+    }
+
+
+def _select_interfaces(
+    counters: dict[str, Any], interfaces: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Pick the interfaces worth returning, and say what was left out.
+
+    A k3s node carries one veth per pod, which on kai-server is 140-plus entries
+    and about 20 KB of response that no incident asks about. Virtual churn is
+    dropped by default and the omission is reported rather than silent, so a
+    caller never mistakes a filtered response for the whole picture.
+    """
+    requested = [name.strip() for name in interfaces.split(",") if name.strip()]
+    if requested and requested != ["default"]:
+        if requested == ["all"]:
+            return dict(counters), {"mode": "all", "omitted": 0}
+        selected = {name: counters[name] for name in requested if name in counters}
+        missing = [name for name in requested if name not in counters]
+        return selected, {"mode": "named", "requested": requested, "not_present": missing}
+
+    kept = {
+        name: value
+        for name, value in counters.items()
+        if not name.startswith(_VIRTUAL_INTERFACE_PREFIXES)
+    }
+    omitted = sorted(set(counters) - set(kept))
+    return kept, {
+        "mode": "default",
+        "omitted": len(omitted),
+        "omitted_prefixes": list(_VIRTUAL_INTERFACE_PREFIXES),
+        "hint": 'pass interfaces="all" for every interface, or a comma-separated list',
     }
 
 
@@ -2708,6 +2906,8 @@ for _tool in (
     get_host_log_usage,
     get_deleted_open_files,
     get_network_info,
+    get_conntrack,
+    get_socket_states,
     get_top_processes,
     get_system_snapshot,
     get_k3s_pods,

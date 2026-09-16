@@ -5,10 +5,17 @@ diagnostics, with an OTLP exporter.
 
 ## Tools
 
-All read-only: 30 host and node tools in [host tools](tools-host.md) and 8
+All read-only: 32 host and node tools in [host tools](tools-host.md) and 8
 cluster tools in [k3s tools](tools-k3s.md), covering CPU, memory, disk,
 filesystem and PSI pressure, usage attribution, deleted open files, network,
 processes, and the k3s pod, volume, scheduling, and health views.
+
+A [networking surface](tools-network.md) covers connection tracking, TCP socket
+states and ephemeral port usage, with per-interface filtering so a k3s node's
+per-pod veth churn does not bury the interfaces that carry traffic. It also
+states which of its readings are cumulative counters and which are
+instantaneous gauges, because only a counter's movement is interpretable and a
+gauge sampled coarsely reads clean through the event it was meant to catch.
 
 ## OTLP export
 

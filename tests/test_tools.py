@@ -18,6 +18,7 @@ import threading
 import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -1577,3 +1578,161 @@ def test_k3s_volume_usage_keeps_fast_tools_responsive(
         return elapsed
 
     assert asyncio.run(run_concurrently()) < 0.1
+
+
+# --- networking surface (node-stats-mcp#7817) --------------------------------
+
+
+# Two CPU rows from a 6.x kernel, header included. Column order moves between
+# kernel versions, which is why the parser reads names. docs/tools-network.md.
+_CONNTRACK_STAT = (
+    "entries clashres found new invalid ignore delete delete_list insert "
+    "insert_failed drop early_drop icmp_error expect_new expect_create "
+    "expect_delete search_restart\n"
+    "0000014d 00000000 00000002 00000000 0000000b 00000000 00000000 00000000 "
+    "00000000 00000003 00000005 00000000 00000000 00000000 00000000 00000000 "
+    "00000007\n"
+    "0000014d 00000000 00000001 00000000 00000004 00000000 00000000 00000000 "
+    "00000000 00000002 0000000a 00000001 00000000 00000000 00000000 00000000 "
+    "00000009\n"
+)
+
+
+def _write_network_procfs(tmp_path: Path, *, count: str = "333", max_: str = "262144") -> None:
+    netfilter = tmp_path / "proc" / "sys" / "net" / "netfilter"
+    netfilter.mkdir(parents=True, exist_ok=True)
+    (netfilter / "nf_conntrack_count").write_text(f"{count}\n")
+    (netfilter / "nf_conntrack_max").write_text(f"{max_}\n")
+    stat_dir = tmp_path / "proc" / "net" / "stat"
+    stat_dir.mkdir(parents=True, exist_ok=True)
+    (stat_dir / "nf_conntrack").write_text(_CONNTRACK_STAT)
+    ipv4 = tmp_path / "proc" / "sys" / "net" / "ipv4"
+    ipv4.mkdir(parents=True, exist_ok=True)
+    (ipv4 / "ip_local_port_range").write_text("32768\t60999\n")
+
+
+def test_conntrack_sums_per_cpu_rows_by_column_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    _write_network_procfs(tmp_path)
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    got = server.get_conntrack()
+
+    assert got["count"] == 333
+    assert got["max"] == 262144
+    assert got["utilization"] == round(333 / 262144, 4)
+    assert got["cpus"] == 2
+    # Hex, summed across both rows: 3+2, 5+10, 0+1.
+    assert got["totals"]["insert_failed"] == 5
+    assert got["totals"]["drop"] == 15
+    assert got["totals"]["early_drop"] == 1
+    assert got["notes"] == []
+
+
+def test_conntrack_parse_is_positional_only_via_the_header(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A kernel that reorders columns must still be read correctly."""
+    _write_network_procfs(tmp_path)
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    reordered = "drop insert_failed\n0000000a 00000003\n00000005 00000002\n"
+    totals, cpus = server._parse_conntrack_stat(reordered)
+
+    assert cpus == 2
+    assert totals["drop"] == 15
+    assert totals["insert_failed"] == 5
+
+
+def test_conntrack_skips_rows_that_do_not_match_the_header(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    _write_network_procfs(tmp_path)
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    totals, cpus = server._parse_conntrack_stat("drop insert_failed\n00000001\n00000002 00000003\n")
+
+    assert cpus == 1
+    assert totals["drop"] == 2
+
+
+def test_conntrack_absent_says_so_rather_than_reporting_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A missing module must not read as a healthy table with no errors."""
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    got = server.get_conntrack()
+
+    assert got["count"] is None
+    assert got["totals"] == {}
+    assert got["notes"] and "not readable" in got["notes"][0]
+
+
+def test_conntrack_reads_through_rootfs_not_bare_proc(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The pod mounts the node at ROOTFS. Bare /proc would read the pod's own
+    namespace the moment hostNetwork changed, which is the silent-wrong class
+    this tool exists to avoid."""
+    _write_network_procfs(tmp_path, count="7")
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    assert server.ROOTFS == str(tmp_path)
+    assert server.get_conntrack()["count"] == 7
+
+
+def test_ephemeral_port_range_is_parsed_from_the_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    _write_network_procfs(tmp_path)
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    got = server._ephemeral_port_range()
+
+    assert got == {"low": 32768, "high": 60999, "size": 60999 - 32768 + 1}
+
+
+def test_network_interface_filter_drops_veth_and_reports_the_omission(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    server = _load(monkeypatch, str(tmp_path), "")
+    counters = {
+        "enp1s0": {"bytes_sent": 1},
+        "flannel.1": {"bytes_sent": 2},
+        "veth1234": {"bytes_sent": 3},
+        "vethabcd": {"bytes_sent": 4},
+    }
+
+    selected, filtering = server._select_interfaces(counters, "default")
+
+    assert set(selected) == {"enp1s0", "flannel.1"}
+    # Filtered, never silently: a caller must be able to tell a filtered
+    # response from the whole picture.
+    assert filtering["omitted"] == 2
+    assert filtering["mode"] == "default"
+
+
+def test_network_interface_filter_all_and_named(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    server = _load(monkeypatch, str(tmp_path), "")
+    counters: dict[str, Any] = {"enp1s0": {}, "veth1": {}, "tailscale0": {}}
+
+    everything, _ = server._select_interfaces(counters, "all")
+    named, meta = server._select_interfaces(counters, "enp1s0, nope0")
+
+    assert set(everything) == {"enp1s0", "veth1", "tailscale0"}
+    assert set(named) == {"enp1s0"}
+    assert meta["not_present"] == ["nope0"]
+
+
+def test_network_info_declares_its_counters_cumulative(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A lifetime counter read as an incident reading is the original defect."""
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    got = server.get_network_info()
+
+    assert got["counter_semantics"] == "cumulative since boot"
+    assert "filtering" in got
