@@ -3,8 +3,25 @@
 Read-only, like every tool here. Part of [host tools](tools-host.md).
 
 - **get_conntrack** - netfilter connection tracking: `count` against `max`, and every per-CPU error column the running kernel publishes, summed.
-- **get_socket_states** - TCP socket counts by state, plus ephemeral port usage against the configured range.
+- **get_socket_states** - TCP socket counts by state, the constant-cost `sockstat` summary, and ephemeral port usage against the configured range.
+- **get_resolver** - the node's resolver, and optionally a pod's own as the container sees it.
 - **get_network_info** - aggregate and per-interface I/O counters, filtered.
+
+## Two socket sources, and when each is the right one
+
+`/proc/net/sockstat` is six labelled lines and costs the same whatever the node is doing. Its `TCP: tw` field is TIME_WAIT, which is the number ephemeral exhaustion actually shows up in, so the cheap file carries the signal.
+
+`/proc/net/tcp` is one line per socket, so reading it costs more exactly when load peaks, which is exactly when an incident wants it. `get_socket_states` walks it for per-state detail because a tool call is on demand, and the summary is read first so it is still present when the walk is denied. **Anything sampling on a short interval should read `sockstat` only.**
+
+Both are parsed by the labels the files carry, never by position, for the same reason the conntrack table is.
+
+## Resolver
+
+`get_resolver()` returns the node's `/etc/resolv.conf`. Given a namespace and pod it also returns that pod's own, read through its host PID at `/proc/<pid>/root/etc/resolv.conf`, which needs `hostPID` and the pod running on this node.
+
+A container's resolver differs from its host's, and that difference is usually the whole hypothesis, so a nameserver mismatch is stated in `notes` rather than left as two lists for the reader to diff. `ndots` is surfaced on its own because it decides how many lookups a short name costs.
+
+When the pod read cannot be satisfied, the note says which reason: no such pod, not on this node, or found but unreadable. An empty result that could mean any of the three is the failure this avoids.
 
 ## Counters and gauges are different readings
 

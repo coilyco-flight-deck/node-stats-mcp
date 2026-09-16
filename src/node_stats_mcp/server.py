@@ -64,6 +64,10 @@ _CONNTRACK_COUNT_PATH = "/proc/sys/net/netfilter/nf_conntrack_count"
 _CONNTRACK_MAX_PATH = "/proc/sys/net/netfilter/nf_conntrack_max"
 _CONNTRACK_STAT_PATH = "/proc/net/stat/nf_conntrack"
 _EPHEMERAL_RANGE_PATH = "/proc/sys/net/ipv4/ip_local_port_range"
+# Six labelled lines, constant cost. /proc/net/tcp is one line per socket and is
+# longest exactly when load peaks. See docs/tools-network.md.
+_SOCKSTAT_PATH = "/proc/net/sockstat"
+_RESOLV_CONF_PATH = "/etc/resolv.conf"
 # One veth per pod is the bulk of a k3s node's interface list and none of them
 # are what an incident asks about. Overridable per deployment.
 _VIRTUAL_INTERFACE_PREFIXES = tuple(
@@ -2681,6 +2685,20 @@ def get_conntrack() -> dict[str, Any]:
     return _conntrack()
 
 
+async def get_resolver(namespace: str = "", pod: str = "") -> dict[str, Any]:
+    """The node's DNS resolver, and optionally a pod's own as the container sees it.
+
+    Give both `namespace` and `pod` to read that pod's resolv.conf through its
+    host PID. A container's resolver differs from its host's, and that
+    difference is what a DNS hypothesis turns on, so a mismatch in nameservers
+    is stated in `notes` rather than left as two lists to diff.
+
+    The pod read needs hostPID and the pod running on this node. When it cannot
+    be satisfied the reason says which, rather than returning an empty result.
+    """
+    return await asyncio.to_thread(_resolver, namespace.strip(), pod.strip())
+
+
 def get_socket_states() -> dict[str, Any]:
     """TCP socket counts by state, and ephemeral port usage against the configured range.
 
@@ -2772,6 +2790,9 @@ def _ephemeral_port_range() -> dict[str, Any]:
 
 def _socket_states() -> dict[str, Any]:
     ephemeral = _ephemeral_port_range()
+    # Constant-cost summary, read first so it is present even when the
+    # per-socket walk below is denied or too expensive to trust.
+    summary = _parse_sockstat(_read_host_text(_SOCKSTAT_PATH) or "")
     states: dict[str, int] = {}
     local_ports: set[int] = set()
     notes: list[str] = []
@@ -2781,10 +2802,12 @@ def _socket_states() -> dict[str, Any]:
         return {
             "states": {},
             "total": 0,
+            "summary": summary,
             "ephemeral": ephemeral,
             "notes": [
-                "Reading socket state was denied. This needs the pod to run with "
-                "hostNetwork and sufficient privilege to read /proc/net/tcp."
+                "Reading per-socket state was denied, so only the constant-cost "
+                "sockstat summary is present. The walk needs hostNetwork and "
+                "privilege to read /proc/net/tcp."
             ],
         }
     low, high = ephemeral["low"], ephemeral["high"]
@@ -2803,9 +2826,131 @@ def _socket_states() -> dict[str, Any]:
     return {
         "states": dict(sorted(states.items())),
         "total": len(connections),
+        "summary": summary,
         "ephemeral": ephemeral,
         "notes": notes,
     }
+
+
+def _parse_sockstat(text: str) -> dict[str, dict[str, int]]:
+    """Parse /proc/net/sockstat, which is six labelled lines of key-value pairs.
+
+    Constant cost regardless of socket count, unlike /proc/net/tcp which is one
+    line per socket and is longest exactly when load peaks. Its `TCP: tw` field
+    is TIME_WAIT, the number ephemeral exhaustion actually shows up in, so the
+    cheap file carries the signal the expensive walk was wanted for.
+
+    Parsed by the labels the file itself carries rather than by position, for
+    the same reason the conntrack table is. See docs/tools-network.md.
+    """
+    out: dict[str, dict[str, int]] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        protocol, _, rest = line.partition(":")
+        fields = rest.split()
+        values: dict[str, int] = {}
+        for index in range(0, len(fields) - 1, 2):
+            try:
+                values[fields[index]] = int(fields[index + 1])
+            except ValueError:
+                continue
+        if values:
+            out[protocol.strip()] = values
+    return out
+
+
+def _parse_resolv_conf(text: str) -> dict[str, Any]:
+    """Parse resolv.conf into the fields a DNS hypothesis actually turns on."""
+    nameservers: list[str] = []
+    search: list[str] = []
+    options: dict[str, Any] = {}
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].split(";", 1)[0].strip()
+        if not line:
+            continue
+        keyword, _, rest = line.partition(" ")
+        keyword = keyword.strip().lower()
+        rest = rest.strip()
+        if keyword == "nameserver" and rest:
+            nameservers.append(rest)
+        elif keyword in {"search", "domain"} and rest:
+            search.extend(rest.split())
+        elif keyword == "options":
+            for option in rest.split():
+                name, sep, value = option.partition(":")
+                options[name] = int(value) if sep and value.isdigit() else True
+    return {
+        "nameservers": nameservers,
+        "search": search,
+        "options": options,
+        # ndots drives how many lookups a short name costs, which is the field a
+        # resolver hypothesis usually turns on.
+        "ndots": options.get("ndots"),
+    }
+
+
+def _pod_host_pid(namespace: str, pod: str) -> tuple[int | None, str | None]:
+    """Find a host PID belonging to one pod, by matching cgroup pod UID.
+
+    Needs hostPID. Returns the reason rather than a bare None so a caller can
+    tell "no such pod" from "this pod runs on another node".
+    """
+    items, _by_container, by_pod_uid, _errors = _k8s_pod_inventory()
+    wanted_uid: str | None = None
+    for entry in items:
+        if entry.get("namespace") == namespace and entry.get("pod") == pod:
+            wanted_uid = entry.get("uid")
+            break
+    if wanted_uid is None:
+        known = any(entry.get("namespace") == namespace for entry in items)
+        if not known:
+            return None, f"no pod {namespace}/{pod} is visible from this node"
+        return None, f"pod {namespace}/{pod} was not found in this node's inventory"
+    del by_pod_uid
+    for proc in psutil.process_iter(["pid"]):
+        pid = proc.info.get("pid")
+        if not pid:
+            continue
+        refs = _parse_cgroup_paths(_read_host_text(f"/proc/{pid}/cgroup"))
+        if refs.pod_uid and refs.pod_uid.lower() == str(wanted_uid).lower():
+            return int(pid), None
+    return None, (
+        f"pod {namespace}/{pod} exists but no process of it was found on this node. "
+        "It may be scheduled elsewhere, or this pod is not running with hostPID."
+    )
+
+
+def _resolver(namespace: str, pod: str) -> dict[str, Any]:
+    node_text = _read_host_text(_RESOLV_CONF_PATH)
+    result: dict[str, Any] = {
+        "node": _parse_resolv_conf(node_text) if node_text else None,
+        "pod": None,
+        "notes": [],
+    }
+    if node_text is None:
+        result["notes"].append(f"{_RESOLV_CONF_PATH} was not readable under ROOTFS")
+    if not namespace or not pod:
+        return result
+
+    pid, reason = _pod_host_pid(namespace, pod)
+    if pid is None:
+        result["notes"].append(reason or "pod resolver unavailable")
+        return result
+    pod_text = _read_host_text(f"/proc/{pid}/root{_RESOLV_CONF_PATH}")
+    if pod_text is None:
+        result["notes"].append(
+            f"found pid {pid} for {namespace}/{pod} but could not read its resolv.conf"
+        )
+        return result
+    parsed = _parse_resolv_conf(pod_text)
+    result["pod"] = {"namespace": namespace, "pod": pod, "pid": pid, **parsed}
+    node = result["node"]
+    if node and node.get("nameservers") != parsed.get("nameservers"):
+        # The difference is the point of the tool, so it is stated rather than
+        # left for the reader to diff two lists.
+        result["notes"].append("pod and node nameservers differ")
+    return result
 
 
 def _select_interfaces(
@@ -2907,6 +3052,7 @@ for _tool in (
     get_deleted_open_files,
     get_network_info,
     get_conntrack,
+    get_resolver,
     get_socket_states,
     get_top_processes,
     get_system_snapshot,

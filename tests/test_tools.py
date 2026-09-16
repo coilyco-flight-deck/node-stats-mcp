@@ -1736,3 +1736,103 @@ def test_network_info_declares_its_counters_cumulative(
 
     assert got["counter_semantics"] == "cumulative since boot"
     assert "filtering" in got
+
+
+def test_sockstat_is_parsed_by_its_own_labels(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """tw is TIME_WAIT, the field ephemeral exhaustion shows up in."""
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    got = server._parse_sockstat(
+        "sockets: used 412\nTCP: inuse 31 orphan 0 tw 1884 alloc 47 mem 6\nUDP: inuse 8 mem 3\n"
+    )
+
+    assert got["TCP"]["tw"] == 1884
+    assert got["TCP"]["inuse"] == 31
+    assert got["UDP"]["mem"] == 3
+    assert got["sockets"]["used"] == 412
+
+
+def test_sockstat_tolerates_an_unknown_or_odd_field(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    got = server._parse_sockstat("TCP: inuse 4 weird notanumber tw 9\nmalformed line\n")
+
+    assert got["TCP"]["inuse"] == 4
+    assert got["TCP"]["tw"] == 9
+
+
+def test_resolv_conf_parses_nameservers_search_and_ndots(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    got = server._parse_resolv_conf(
+        "# generated\n"
+        "nameserver 10.43.0.10\n"
+        "nameserver 1.1.1.1\n"
+        "search default.svc.cluster.local svc.cluster.local\n"
+        "options ndots:5 edns0\n"
+    )
+
+    assert got["nameservers"] == ["10.43.0.10", "1.1.1.1"]
+    assert got["search"] == ["default.svc.cluster.local", "svc.cluster.local"]
+    assert got["ndots"] == 5
+    assert got["options"]["edns0"] is True
+
+
+def test_resolver_reads_the_node_through_rootfs(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    (tmp_path / "etc").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "etc" / "resolv.conf").write_text("nameserver 192.168.1.1\noptions ndots:1\n")
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    got = asyncio.run(server.get_resolver())
+
+    assert got["node"]["nameservers"] == ["192.168.1.1"]
+    assert got["node"]["ndots"] == 1
+    assert got["pod"] is None
+
+
+def test_resolver_missing_node_file_is_a_note_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    got = asyncio.run(server.get_resolver())
+
+    assert got["node"] is None
+    assert got["notes"] and "not readable" in got["notes"][0]
+
+
+def test_resolver_reports_why_a_pod_read_failed(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """An unreachable pod must say which reason, not return an empty result."""
+    (tmp_path / "etc").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "etc" / "resolv.conf").write_text("nameserver 10.0.0.1\n")
+    server = _load(monkeypatch, str(tmp_path), "")
+    monkeypatch.setattr(server, "_k8s_pod_inventory", lambda: ([], {}, {}, []))
+
+    got = asyncio.run(server.get_resolver("kube-system", "coredns-abc"))
+
+    assert got["pod"] is None
+    assert any("no pod kube-system/coredns-abc" in note for note in got["notes"])
+
+
+def test_resolver_states_a_pod_node_nameserver_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The difference is the point of the tool, so it is said rather than implied."""
+    (tmp_path / "etc").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "etc" / "resolv.conf").write_text("nameserver 192.168.1.1\n")
+    pod_root = tmp_path / "proc" / "4242" / "root" / "etc"
+    pod_root.mkdir(parents=True, exist_ok=True)
+    (pod_root / "resolv.conf").write_text("nameserver 10.43.0.10\noptions ndots:5\n")
+    server = _load(monkeypatch, str(tmp_path), "")
+    monkeypatch.setattr(server, "_pod_host_pid", lambda ns, pod: (4242, None))
+
+    got = asyncio.run(server.get_resolver("default", "web"))
+
+    assert got["pod"]["nameservers"] == ["10.43.0.10"]
+    assert got["pod"]["ndots"] == 5
+    assert got["pod"]["pid"] == 4242
+    assert "pod and node nameservers differ" in got["notes"]
