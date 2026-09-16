@@ -1836,3 +1836,89 @@ def test_resolver_states_a_pod_node_nameserver_mismatch(
     assert got["pod"]["ndots"] == 5
     assert got["pod"]["pid"] == 4242
     assert "pod and node nameservers differ" in got["notes"]
+
+
+def test_disk_info_surfaces_mount_options_and_quota_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Mount options are where a per-directory ceiling would be visible.
+
+    Without them, PVC directories sharing one filesystem look identical to
+    filesystems with separate capacities, which is the reading that stalled
+    coilyco-bridge/inbox#7830.
+    """
+    server = _load(monkeypatch, str(tmp_path), "")
+    fake = [
+        SimpleNamespace(
+            device="/dev/mapper/vg-lv", mountpoint="/", fstype="ext4", opts="rw,relatime"
+        ),
+        SimpleNamespace(device="/dev/sdb1", mountpoint="/data", fstype="xfs", opts="rw,prjquota"),
+    ]
+    monkeypatch.setattr(server.psutil, "disk_partitions", lambda **_kwargs: fake)
+
+    parts = {p["mountpoint"]: p for p in server.get_disk_info()["partitions"]}
+
+    assert parts["/"]["options"] == ["rw", "relatime"]
+    assert parts["/"]["quota_enforced"] is False
+    assert parts["/data"]["options"] == ["rw", "prjquota"]
+    assert parts["/data"]["quota_enforced"] is True
+
+
+def test_disk_info_without_options_does_not_claim_a_quota(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A platform whose psutil omits opts must read as unknown-shaped, not quota'd."""
+    server = _load(monkeypatch, str(tmp_path), "")
+    fake = [SimpleNamespace(device="d", mountpoint="/", fstype="ext4", opts="")]
+    monkeypatch.setattr(server.psutil, "disk_partitions", lambda **_kwargs: fake)
+
+    part = server.get_disk_info()["partitions"][0]
+
+    assert part["options"] == []
+    assert part["quota_enforced"] is False
+
+
+def test_conntrack_says_counters_are_unread_when_only_the_stat_table_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The observed failure on kai-server: sysctls parsed, stat table absent.
+
+    Empty totals with an empty notes list reads as "no errors recorded" when it
+    means "not read". insert_failed, drop and early_drop are the whole reason
+    this tool exists, so their absence has to be stated.
+    """
+    netfilter = tmp_path / "proc" / "sys" / "net" / "netfilter"
+    netfilter.mkdir(parents=True, exist_ok=True)
+    (netfilter / "nf_conntrack_count").write_text("15614\n")
+    (netfilter / "nf_conntrack_max").write_text("917504\n")
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    got = server.get_conntrack()
+
+    assert got["count"] == 15614
+    assert got["max"] == 917504
+    assert got["totals"] == {}
+    assert got["notes"], "empty totals with no note reads as zero errors"
+    assert "UNREAD rather than zero" in got["notes"][0]
+
+
+def test_conntrack_says_counters_are_unread_when_the_table_parses_to_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    _write_network_procfs(tmp_path)
+    stat = tmp_path / "proc" / "net" / "stat" / "nf_conntrack"
+    stat.write_text("entries drop\n")  # header only, no CPU rows
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    got = server.get_conntrack()
+
+    assert got["cpus"] == 0
+    assert got["notes"] and "UNREAD rather than zero" in got["notes"][0]
+
+
+def test_conntrack_healthy_read_carries_no_note(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """The note must not fire on a good read, or it becomes noise to skim past."""
+    _write_network_procfs(tmp_path)
+    server = _load(monkeypatch, str(tmp_path), "")
+
+    assert server.get_conntrack()["notes"] == []

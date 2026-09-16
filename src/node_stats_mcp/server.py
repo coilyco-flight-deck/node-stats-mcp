@@ -2541,7 +2541,13 @@ def get_memory_info() -> dict[str, Any]:
 
 
 def get_disk_info() -> dict[str, Any]:
-    """Usage and mount info for the node's real filesystems (under ROOTFS)."""
+    """Usage and mount info for the node's real filesystems (under ROOTFS).
+
+    `options` carries the mount flags, which is where quota enforcement shows up
+    (`prjquota`, `quota`, `usrquota`, `grpquota`) alongside `ro` and `noexec`.
+    Without it, two directories on one shared filesystem are indistinguishable
+    from two filesystems with separate ceilings. See docs/tools-host.md.
+    """
     partitions = []
     for part in psutil.disk_partitions(all=False):
         mount = Path(ROOTFS).joinpath(part.mountpoint.lstrip("/"))
@@ -2549,11 +2555,14 @@ def get_disk_info() -> dict[str, Any]:
             usage = psutil.disk_usage(str(mount))._asdict()
         except (PermissionError, FileNotFoundError, OSError):
             usage = {}
+        options = [opt for opt in getattr(part, "opts", "").split(",") if opt]
         partitions.append(
             {
                 "device": part.device,
                 "mountpoint": part.mountpoint,
                 "fstype": part.fstype,
+                "options": options,
+                "quota_enforced": any(opt.endswith("quota") for opt in options),
                 "usage": usage,
             }
         )
@@ -2760,6 +2769,18 @@ def _conntrack() -> dict[str, Any]:
         notes.append(
             "nf_conntrack is not readable here. The module may be unloaded, or the "
             "pod may lack the host /proc mount and hostNetwork."
+        )
+    elif stat_text is None:
+        # The sysctls can parse while the stat table is absent. Empty totals then
+        # read as zero errors rather than as no reading. See docs/tools-network.md.
+        notes.append(
+            f"{_CONNTRACK_STAT_PATH} is not present, so insert_failed, drop and "
+            "early_drop are UNREAD rather than zero. count and max above are real."
+        )
+    elif not totals:
+        notes.append(
+            f"{_CONNTRACK_STAT_PATH} was read but no per-CPU rows parsed, so "
+            "insert_failed, drop and early_drop are UNREAD rather than zero."
         )
     utilization = None
     if count is not None and maximum:
