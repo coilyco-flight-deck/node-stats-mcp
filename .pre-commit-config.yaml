@@ -10,9 +10,12 @@ repos:
     rev: v1.20.0
     hooks:
       - id: mypy
+        # Pinned to what uv.lock resolves, not a floating lower bound. These
+        # are the stubs mypy checks the code against, so a drift here type-checks
+        # against a library the image never ships. See docs/configuration.md.
         additional_dependencies:
-          - psutil>=6.0.0
-          - mcp>=1.14.0
+          - psutil==7.2.2
+          - mcp==1.28.1
 
   - repo: local
     hooks:
